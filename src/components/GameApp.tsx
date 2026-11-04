@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { applyAction, appearance, createGame, power, stats, xpRequired } from '@/game/engine';
 import { CLASSES, ENHANCE_CHANCES, MONSTERS, POTIONS, ZONES } from '@/game/config';
 import type { Action, CharacterClass, GameState, HealPotionKind, PotionKind, ZoneId } from '@/game/types';
-import { getAuthClient, onlineConfigured } from '@/lib/supabase';
+import { getAuthClient, getAuthConfigurationError, onlineConfigured } from '@/lib/supabase';
 import { createOnlineGame, fetchRankings, loadGame, sendOnlineAction, type RankingEntry, type RankingKind } from '@/lib/transport';
 
 const WorldChat = dynamic(() => import('./WorldChat'), { ssr: false });
@@ -85,7 +85,7 @@ export default function GameApp() {
   useEffect(() => {
     setHasDemo(!!getSavedDemo());
     const auth = getAuthClient();
-    if (!auth) return;
+    if (!auth) { const issue = getAuthConfigurationError(); if (issue && onlineConfigured) setNotice(issue); return; }
     auth.auth.getSession().then(({ data }) => { const access = data.session?.access_token ?? null; tokenRef.current = access; setToken(access); setSessionUserId(data.session?.user.id ?? null); }).catch(() => setNotice('로그인 정보를 확인하지 못했습니다. 다시 로그인해주세요.'));
     const { data } = auth.auth.onAuthStateChange((_event, session) => {
       tokenRef.current = session?.access_token ?? null;
@@ -200,9 +200,11 @@ export default function GameApp() {
     } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   }
   async function authenticate(e: FormEvent) {
-    e.preventDefault(); const auth = getAuthClient(); if (!auth) return;
+    e.preventDefault();
     setBusy(true); setError('');
     try {
+      const auth = getAuthClient();
+      if (!auth) throw new Error(getAuthConfigurationError() || '온라인 계정 연결이 준비되지 않았습니다. 연결 상태 확인을 눌러주세요.');
       const result = signup ? await auth.auth.signUp({ email, password }) : await auth.auth.signInWithPassword({ email, password });
       if (result.error) throw result.error;
       setPassword('');
@@ -212,7 +214,10 @@ export default function GameApp() {
       setSessionUserId(result.data.session.user.id);
       const saved = await loadGame(result.data.session.access_token);
       if (saved) enterGame(saved, 'online'); else { setNickname(''); setModal('create'); }
-    } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+    } catch (e) {
+      const message = e instanceof Error ? e.message : '회원가입 또는 로그인 요청을 처리하지 못했습니다.';
+      setError(/failed to fetch|networkerror|load failed/i.test(message) ? '인증 서버에 연결하지 못했습니다. 아래 연결 상태 확인을 눌러주세요.' : message);
+    } finally { setBusy(false); }
   }
   async function makeCharacter(e: FormEvent) {
     e.preventDefault(); setBusy(true); setError('');
@@ -270,6 +275,7 @@ export default function GameApp() {
     {error && !modal && <div className="error-toast" role="alert">{error}<button onClick={() => setError('')} aria-label="오류 닫기">×</button></div>}
     {modal && <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget && !busy) setModal(null); }}><section ref={modalElementRef} tabIndex={-1} className={`modal modal-${modal}`} role="dialog" aria-modal="true" aria-label={modalTitles[modal]}><header className="modal-header"><div><p className="section-label">CLASSIC CHRONICLES</p><h2>{modalTitles[modal]}</h2></div><button className="modal-close" onClick={() => setModal(null)} aria-label="창 닫기">×</button></header><div className="modal-body">
       {error && <p className="form-error" role="alert">{error}</p>}
+      {modal === 'auth' && <p className="local-note"><a href="/connection" className="gold-text">회원가입이 안 되나요? 연결 상태 확인 ↗</a></p>}
       {modal === 'play' && <div className="play-choices"><button onClick={() => void startOnline()}><span>♜</span><h3>친구들과 랭킹 경쟁</h3><p>계정으로 로그인하여 어디서든<br />나의 캐릭터를 이어서 플레이하세요.</p><b>온라인 게임 시작 →</b></button><button onClick={continueDemo}><span>⚔</span><h3>바로 모험 시작하기</h3><p>가입 없이 이 브라우저에서 플레이합니다.<br />데모 기록은 공용 랭킹에 포함되지 않습니다.</p><b>{hasDemo ? '로컬 데모 이어하기' : '로컬 데모 캐릭터 생성'} →</b></button></div>}
       {modal === 'auth' && <>{!onlineConfigured ? <div className="empty-state"><span>♜</span><h3>온라인 연결을 준비하고 있습니다</h3><p>현재 온라인 계정 서비스가 연결되지 않았습니다.<br />관리자가 Supabase 설정을 완료하면 회원가입과<br />공용 랭킹을 사용할 수 있습니다.</p><button className="button primary" onClick={continueDemo}>먼저 로컬 데모 플레이</button></div> : <form onSubmit={authenticate} className="auth-form"><p className="muted">당신의 캐릭터와 모험 기록을 안전하게 보관합니다.</p><label>이메일<input type="email" autoComplete="email" required value={email} onChange={e => setEmail(e.target.value)} placeholder="adventurer@example.com" /></label><label>비밀번호<input type="password" autoComplete={signup ? 'new-password' : 'current-password'} required minLength={8} value={password} onChange={e => setPassword(e.target.value)} placeholder="8자 이상 입력해주세요" /></label><button className="button primary full" disabled={busy}>{busy ? '연결 중…' : signup ? '회원가입' : '로그인'}</button><button type="button" className="text-button" onClick={() => { setSignup(!signup); setError(''); }}>{signup ? '이미 계정이 있으신가요? 로그인' : '처음 방문하셨나요? 회원가입'}</button></form>}</>}
       {(modal === 'demo' || modal === 'create') && <form onSubmit={makeCharacter} className="character-form"><p className="muted">당신의 길을 선택하세요. 생성 후 직업은 변경할 수 없습니다.</p><div className="class-options">{(['knight', 'elf'] as const).map(c => <button type="button" key={c} className={chosenClass === c ? 'selected' : ''} onClick={() => setChosenClass(c)}><div className={`class-illustration class-${c}`}><WeaponIcon elf={c === 'elf'} size={90} /></div><small>{c === 'knight' ? 'KNIGHT' : 'ELF'}</small><h3>{CLASS_LABEL[c]}</h3><p>{c === 'knight' ? '튼튼한 방어 · 근거리 검술' : '긴 사거리 · 정교한 활 사격'}</p><span>{CLASSES[c].weapon}</span></button>)}</div><label>캐릭터 닉네임<input required minLength={2} maxLength={14} value={nickname} onChange={e => setNickname(e.target.value)} placeholder="한글·영문·숫자·밑줄 2~14자" /></label>{modal === 'demo' && <p className="local-note">로컬 데모는 이 브라우저에만 저장됩니다. 새 캐릭터를 만들면 기존 데모 기록을 덮어씁니다.</p>}<button className="button primary full" disabled={busy}>{busy ? '캐릭터 생성 중…' : '모험의 첫걸음 내딛기 →'}</button></form>}
