@@ -26,7 +26,7 @@ async function selectMonster(page: Page, index = 0) {
 
 test('메인 화면·확률표 공개, 외부 연결 없는 랭킹 상태도 명확하다', async ({ page }) => {
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: /클래식.*범재와의 전쟁/ })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /클래식.*범죄와의 전쟁/ })).toBeVisible();
   await page.getByRole('button', { name: /무기 강화 확률표/ }).click();
   const dialog = page.getByRole('dialog');
   await expect(dialog.locator('tbody tr')).toHaveCount(10);
