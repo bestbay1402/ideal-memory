@@ -6,6 +6,7 @@ export const WORLD_HEIGHT = 1040;
 export const PLAYER_RADIUS = 13;
 export const PLAYER_SPEED = 150; // 기사와 요정의 이동속도(초당 픽셀)
 export const ATTACK_INTERVAL = 1000;
+export const AUTO_ATTACK_RANGE = 58; // 가만히 있을 때 주변 몬스터를 자동으로 선택하는 거리
 export const GREEN_DURATION = 600_000; // 초록 물약 10분 (서버 시간)
 export const POTION_INTERVAL = 1000;
 export const AUTO_POTION_THRESHOLD = 0.8;
@@ -13,7 +14,11 @@ export const RESPAWN_MS = 8000;
 export const MAX_TICK_MS = 500;
 export const MAX_LEVEL = 99;
 export const MAX_ENHANCEMENT = 10;
-export const ENHANCE_CHANCES = [1, 1, 1, 0.95, 0.7, 0.5, 0.3, 0.19, 0.12, 0.05] as const;
+export const ENHANCE_CHANCES = [1, 1, 1, 1, 0.95, 0.70, 0.50, 0.30, 0.19, 0.10] as const;
+// 배열 위치는 현재 강화 수치입니다. +0~+4 도달은 100% 성공하므로 앞 네 실패값은 사용되지 않습니다.
+export const ENHANCE_FAILURE_LEVELS = [0, 1, 2, 3, 3, 4, 5, 6, 7, 8] as const;
+// 필요 경험치는 유지하고 몬스터에게서 받는 경험치만 3배로 늘립니다.
+export const XP_MULTIPLIER = 3;
 export const ATTACK_BONUS = [0, 3, 6, 10, 15, 22, 31, 44, 61, 86, 125] as const;
 export const ARMOR_BONUS = [0, 1, 2, 3, 5, 7, 10, 14, 19, 25, 33] as const;
 export const CLASSES: Record<CharacterClass, { name: string; weapon: string; hp: number; hpPerLevel: number; attack: number; defense: number; range: number }> = {
@@ -26,11 +31,11 @@ export const POTIONS: Record<PotionKind, { name: string; price: number; heal: nu
   clear: { name: '맑은 물약', price: 140, heal: 150, color: '#a6deeb' },
   green: { name: '초록 물약', price: 4000, heal: 0, color: '#79c477' },
 };
-export const ZONES: Record<ZoneId, { name: string; requirement: number; description: string; color: string; aggressive: boolean; adena: [number, number]; xp: [number, number]; scrollChance: number; monsters: [MonsterKind, MonsterKind] }> = {
-  island: { name: '말하는 섬', requirement: 0, description: '바람이 머무는 숲, 모험이 시작되는 곳', color: '#4c715b', aggressive: false, adena: [40, 60], xp: [10, 20], scrollChance: 0.05, monsters: ['slime', 'werewolf'] },
-  temple: { name: '카오틱 신전', requirement: 6, description: '붉은 안개 너머 잠든 고대 신전', color: '#9c4f52', aggressive: true, adena: [120, 180], xp: [30, 45], scrollChance: 0.1, monsters: ['bugbear', 'orc'] },
-  volcano: { name: '화룡의 둥지', requirement: 7, description: '꺼지지 않는 불꽃과 검게 탄 대지', color: '#d67741', aggressive: true, adena: [300, 420], xp: [70, 100], scrollChance: 0.18, monsters: ['ifrit', 'phoenix'] },
-  tower: { name: '오만의 탑', requirement: 9, description: '마지막 영웅을 기다리는 어둠의 성채', color: '#887da7', aggressive: true, adena: [700, 1000], xp: [150, 220], scrollChance: 0.3, monsters: ['vampire', 'cougar'] },
+export const ZONES: Record<ZoneId, { name: string; recommendedEnhancement: number; description: string; color: string; aggressive: boolean; adena: [number, number]; xp: [number, number]; scrollChance: number; monsters: [MonsterKind, MonsterKind] }> = {
+  island: { name: '말하는 섬', recommendedEnhancement: 0, description: '바람이 머무는 숲, 모험이 시작되는 곳', color: '#4c715b', aggressive: false, adena: [40, 60], xp: [10, 20], scrollChance: 0.05, monsters: ['slime', 'werewolf'] },
+  temple: { name: '카오틱 신전', recommendedEnhancement: 6, description: '붉은 안개 너머 잠든 고대 신전', color: '#9c4f52', aggressive: true, adena: [120, 180], xp: [30, 45], scrollChance: 0.1, monsters: ['bugbear', 'orc'] },
+  volcano: { name: '화룡의 둥지', recommendedEnhancement: 7, description: '꺼지지 않는 불꽃과 검게 탄 대지', color: '#d67741', aggressive: true, adena: [300, 420], xp: [70, 100], scrollChance: 0.18, monsters: ['ifrit', 'phoenix'] },
+  tower: { name: '오만의 탑', recommendedEnhancement: 9, description: '마지막 영웅을 기다리는 어둠의 성채', color: '#887da7', aggressive: true, adena: [700, 1000], xp: [150, 220], scrollChance: 0.3, monsters: ['vampire', 'cougar'] },
 };
 export const MONSTERS: Record<MonsterKind, { name: string; hp: number; attack: number; defense: number; speed: number; attackInterval: number; range: number }> = {
   slime: { name: '슬라임', hp: 58, attack: 14, defense: 0, speed: 43, attackInterval: 1700, range: 39 },
@@ -42,7 +47,7 @@ export const MONSTERS: Record<MonsterKind, { name: string; hp: number; attack: n
   vampire: { name: '뱀파이어', hp: 1580, attack: 74, defense: 18, speed: 83, attackInterval: 1400, range: 58 },
   cougar: { name: '쿠거', hp: 1490, attack: 78, defense: 16, speed: 103, attackInterval: 1450, range: 48 },
 };
-// 구간별 적정 사냥터의 경험치/처치시간을 이용해 1/2/4/6시간으로 배분합니다.
+// 필요 경험치표의 기준은 기존 1/2/4/6시간을 유지합니다. 실제 성장 목표는 XP_MULTIPLIER로 나눕니다.
 // 1~30: 말하는 섬, 30~60: 카오틱 신전, 60~90: 화룡의 둥지, 90~99: 오만의 탑.
 export const GROWTH_STAGES = [
   // scripts/balance.ts의 실제 전투 엔진 표본으로 보정한 가속 처치시간(짧은 이동 1초 포함).

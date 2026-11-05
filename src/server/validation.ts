@@ -26,7 +26,7 @@ export function validateCommand(value: unknown): { requestId: string; action: Ac
   try {
     const raw = record(input.action);
     const allowed: Record<string, string[]> = {
-      tick: ['type', 'dx', 'dy'], target: ['type', 'id'], travel: ['type', 'zone'],
+      tick: ['type', 'dx', 'dy'], target: ['type', 'id'], moveTo: ['type', 'x', 'y'], travel: ['type', 'zone'],
       enhance: ['type'], buy: ['type', 'kind', 'quantity'],
       usePotion: ['type', 'kind'], autoPotion: ['type', 'enabled', 'kind'],
     };

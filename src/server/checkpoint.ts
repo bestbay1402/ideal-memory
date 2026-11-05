@@ -65,7 +65,7 @@ function validateMonsters(value: unknown, zone: ZoneId, time: number): Monster[]
  * 클라이언트의 사냥/강화 이력을 서버에서 재연산하는 부정행위 방지 기능은 아닙니다.
  */
 export function validateCheckpointState(value: unknown, previous: GameState, now: number): GameState {
-  const s = record(value, ['version', 'player', 'monsters', 'zone', 'time', 'targetId', 'nextAttackAt', 'nextPotionAt', 'greenWarningSent', 'sequence', 'logs', 'effects', 'zoneMonsters']);
+  const s = record(value, ['version', 'player', 'monsters', 'zone', 'time', 'targetId', 'moveDestination', 'movePath', 'nextAttackAt', 'nextPotionAt', 'greenWarningSent', 'sequence', 'logs', 'effects', 'zoneMonsters']);
   if (s.version !== 1) reject();
   const time = timestamp(s.time, now + 30_000);
   const zone = oneOf(s.zone, zones);
@@ -75,7 +75,7 @@ export function validateCheckpointState(value: unknown, previous: GameState, now
   const level = number(p.level, previous.player.level, MAX_LEVEL, true);
   const xp = number(p.xp, 0, level === MAX_LEVEL ? 0 : XP_TABLE[level] - 1, true);
   if (level === previous.player.level && xp < previous.player.xp) reject();
-  const enhancement = number(p.enhancement, ZONES[zone].requirement, MAX_ENHANCEMENT, true);
+  const enhancement = number(p.enhancement, 0, MAX_ENHANCEMENT, true);
   number(p.bestEnhancement, Math.max(previous.player.bestEnhancement, enhancement), MAX_ENHANCEMENT, true);
   number(p.hp, 1, CLASSES[characterClass].hp + (level - 1) * CLASSES[characterClass].hpPerLevel, true);
   number(p.adena, 0, Number.MAX_SAFE_INTEGER, true);
@@ -85,10 +85,15 @@ export function validateCheckpointState(value: unknown, previous: GameState, now
   const potions = record(p.potions, ['red', 'orange', 'clear', 'green']);
   for (const kind of ['red', 'orange', 'clear', 'green']) number(potions[kind], 0, 1_000_000, true);
   const auto = record(p.autoPotion, ['enabled', 'kind']);
-  bool(auto.enabled); oneOf(auto.kind, ['red', 'orange', 'clear']);
+  bool(auto.enabled); oneOf(auto.kind, ['red', 'orange', 'clear', 'green']);
   timestamp(p.greenUntil, time + GREEN_DURATION + 1000);
   const monsters = validateMonsters(s.monsters, zone, time);
   if (s.targetId !== null && !monsters.some(m => m.id === s.targetId && m.alive)) reject();
+  if (s.moveDestination !== undefined && s.moveDestination !== null) point(record(s.moveDestination, ['x', 'y']));
+  if (s.movePath !== undefined) {
+    if (!Array.isArray(s.movePath) || s.movePath.length > 200) reject();
+    for (const waypoint of s.movePath) point(record(waypoint, ['x', 'y']));
+  }
   timestamp(s.nextAttackAt, time + 2000);
   timestamp(s.nextPotionAt, time + POTION_INTERVAL + 1000);
   bool(s.greenWarningSent);

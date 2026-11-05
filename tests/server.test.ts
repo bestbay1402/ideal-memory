@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
 import { createGame } from '../src/game/engine';
+import { WORLD_HEIGHT, WORLD_WIDTH } from '../src/game/config';
 import type { GameState } from '../src/game/types';
 import { executeCommand, type CommitResult, type GameStore, type StoredGame } from '../src/server/store';
 import { validateCommand, validateCreate, readJson } from '../src/server/validation';
@@ -52,6 +53,18 @@ describe('server request boundary', () => {
     ]) expect(() => validateCommand({ requestId, action })).toThrow();
     expect(() => validateCommand({ requestId, action: { type: 'enhance' }, owner: 'bob' })).toThrow();
   });
+  it('accepts bounded movement commands and green auto-use while rejecting forged movement fields', () => {
+    const requestId = randomUUID();
+    for (const action of [
+      { type: 'moveTo', x: 0, y: 0 }, { type: 'moveTo', x: WORLD_WIDTH, y: WORLD_HEIGHT },
+      { type: 'autoPotion', enabled: true, kind: 'green' },
+    ]) expect(validateCommand({ requestId, action })).toEqual({ requestId, action });
+    for (const action of [
+      { type: 'moveTo', x: -1, y: 0 }, { type: 'moveTo', x: 0, y: WORLD_HEIGHT + 1 },
+      { type: 'moveTo', x: Infinity, y: 0 }, { type: 'moveTo', x: 0 },
+      { type: 'moveTo', x: 0, y: 0, path: [{ x: 500, y: 500 }] },
+    ]) expect(() => validateCommand({ requestId, action })).toThrow();
+  });
   it('limits request body size and rejects malformed JSON', async () => {
     await expect(readJson(new Request('http://localhost', { method: 'POST', body: '{' }))).rejects.toThrow();
     await expect(readJson(new Request('http://localhost', { method: 'POST', body: 'x'.repeat(5000) }))).rejects.toThrow();
@@ -99,6 +112,7 @@ describe('authoritative concurrency orchestration', () => {
       executeCommand(store, 'alice', { type: 'tick', dx: 0, dy: 0 }, randomUUID(), () => 1200, () => 0),
     ]);
     expect(store.rows.get('alice')!.state.player.adena - before).toBe(40);
+    expect(store.rows.get('alice')!.state.player.xp).toBe(30);
     expect(store.rows.get('alice')!.state.monsters[0].alive).toBe(false);
   });
   it('keeps account state independent and returns saved state after reloading', async () => {

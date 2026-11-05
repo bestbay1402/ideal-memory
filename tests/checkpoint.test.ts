@@ -3,8 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
 import { applyAction, createGame } from '../src/game/engine';
-import { GREEN_DURATION } from '../src/game/config';
+import { GREEN_DURATION, WORLD_HEIGHT, WORLD_WIDTH } from '../src/game/config';
 import type { GameState } from '../src/game/types';
+import { spawnMonsters } from '../src/game/world';
 import type { CommitResult, GameStore, StoredGame } from '../src/server/store';
 import { CHECKPOINT_MAX_BYTES, readCheckpointJson, saveCheckpoint, validateCheckpointEnvelope, validateCheckpointState } from '../src/server/checkpoint';
 import { ApiError } from '../src/server/errors';
@@ -50,6 +51,44 @@ class MemoryStore implements GameStore {
 }
 
 describe('checkpoint envelope and bounded state validation', () => {
+  it.each(['island', 'temple', 'volcano', 'tower'] as const)('accepts +0 weapons in %s and preserves movement and green auto-use', zone => {
+    const initial = createGame('저장기사', 'knight', NOW);
+    const state = structuredClone(initial);
+    state.zone = zone;
+    state.monsters = spawnMonsters(zone);
+    state.moveDestination = { x: 600, y: 500 };
+    state.movePath = [{ x: 220, y: 500 }, { x: 600, y: 500 }];
+    state.player.autoPotion = { enabled: true, kind: 'green' };
+    const saved = validateCheckpointState(state, initial, NOW);
+    expect(saved).toMatchObject({ zone, moveDestination: state.moveDestination, movePath: state.movePath });
+    expect(saved.player).toMatchObject({ enhancement: 0, autoPotion: { enabled: true, kind: 'green' } });
+  });
+
+  it('accepts existing saves without movement fields and bounded empty or full paths', () => {
+    const legacy = createGame('저장기사', 'knight', NOW);
+    delete legacy.moveDestination;
+    delete legacy.movePath;
+    expect(validateCheckpointState(legacy, legacy, NOW)).toEqual(legacy);
+    const stopped = { ...legacy, moveDestination: null, movePath: [] };
+    expect(validateCheckpointState(stopped, legacy, NOW)).toEqual(stopped);
+    const longestPath = { ...legacy, moveDestination: { x: WORLD_WIDTH, y: WORLD_HEIGHT }, movePath: Array.from({ length: 200 }, () => ({ x: 0, y: 0 })) };
+    expect(validateCheckpointState(longestPath, legacy, NOW).movePath).toHaveLength(200);
+  });
+
+  it('rejects malformed, unbounded and oversized movement data', () => {
+    const initial = createGame('저장기사', 'knight', NOW);
+    const corrupt = [
+      { moveDestination: { x: -1, y: 0 } }, { moveDestination: { x: 0, y: WORLD_HEIGHT + 1 } },
+      { moveDestination: { x: Infinity, y: 0 } }, { moveDestination: { x: 0 } },
+      { moveDestination: { x: 0, y: 0, owner: 'bob' } }, { moveDestination: [0, 0] },
+      { movePath: null }, { movePath: {} }, { movePath: [null] },
+      { movePath: [{ x: WORLD_WIDTH + 1, y: 0 }] }, { movePath: [{ x: 0, y: NaN }] },
+      { movePath: [{ x: 0, y: 0, speed: 999 }] },
+      { movePath: Array.from({ length: 201 }, () => ({ x: 0, y: 0 })) },
+    ];
+    for (const movement of corrupt) expect(() => validateCheckpointState({ ...initial, ...movement }, initial, NOW)).toThrow(ApiError);
+  });
+
   it('accepts an actual playthrough snapshot, including all region monster caches', () => {
     const initial = createGame('저장기사', 'knight', NOW);
     let state = initial;
@@ -136,12 +175,19 @@ describe('checkpoint concurrency and authenticated ownership', () => {
   afterEach(() => vi.restoreAllMocks());
   it('saves a complete snapshot and leaves another account untouched', async () => {
     const store = new MemoryStore(), bob = await store.read('bob');
-    const result = await saveCheckpoint(store, 'alice', command(progressed()), NOW + 100);
+    const state = progressed();
+    state.zone = 'tower'; state.monsters = spawnMonsters('tower');
+    state.moveDestination = { x: 500, y: 500 }; state.movePath = [{ x: 220, y: 500 }, { x: 500, y: 500 }];
+    state.player.autoPotion = { enabled: true, kind: 'green' };
+    const result = await saveCheckpoint(store, 'alice', command(state), NOW + 100);
     expect(result.revision).toBe(1);
     expect(result.savedAt).toBe(NOW + 100);
     expect((await store.read('alice'))!.state).toEqual(result.state);
     expect(await store.read('bob')).toEqual(bob);
     expect(result.state.player.kills).toBe(7);
+    expect(result.state.zone).toBe('tower');
+    expect(result.state.movePath).toEqual(state.movePath);
+    expect(result.state.player.autoPotion).toEqual({ enabled: true, kind: 'green' });
     await expect(saveCheckpoint(store, 'bob', command(result.state), NOW + 200)).rejects.toMatchObject({ status: 400 });
   });
 

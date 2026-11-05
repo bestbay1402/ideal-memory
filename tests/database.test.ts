@@ -74,7 +74,7 @@ describe('누적 처치 수 SQL 마이그레이션과 서버 저장', () => {
     const saved = (await store.read(owner))!.state;
     expect(saved.player.kills).toBe(23);
     expect(saved.player.adena).toBe(state.player.adena + 40);
-    expect(saved.player.xp).toBe(10);
+    expect(saved.player.xp).toBe(30);
     const ranking = await db.query<{ kills: number }>('select kills from public.public_leaderboard where nickname=$1', [state.player.nickname]);
     expect(Number(ranking.rows[0].kills)).toBe(23);
   });

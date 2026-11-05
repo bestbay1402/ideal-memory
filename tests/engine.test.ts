@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { appearance, applyAction, createGame, power, stats, validateAction, xpRequired } from '../src/game/engine';
-import { ATTACK_INTERVAL, ENHANCE_CHANCES, GREEN_DURATION, MONSTERS, POTIONS, RESPAWN_MS, ZONES } from '../src/game/config';
+import { ATTACK_INTERVAL, ENHANCE_CHANCES, ENHANCE_FAILURE_LEVELS, GREEN_DURATION, MONSTERS, PLAYER_SPEED, POTIONS, RESPAWN_MS, XP_MULTIPLIER, ZONES } from '../src/game/config';
 import { collides, SPAWN } from '../src/game/world';
 import type { GameState, ZoneId } from '../src/game/types';
 
@@ -56,8 +56,9 @@ describe('캐릭터와 이동', () => {
     s = applyAction(s, { type: 'tick', dx: -1, dy: 0 }, s.time + 200);
     expect(s.targetId).toBeNull();
   });
-  it('비선공 몬스터는 가까이 있어도 공격받기 전까지 피해를 주지 않는다', () => {
+  it('접촉 범위 밖의 비선공 몬스터는 공격받기 전까지 피해를 주지 않는다', () => {
     const s = prepared();
+    s.monsters[0].x = s.monsters[0].homeX = s.player.x + 120;
     const after = tick(s, 10);
     expect(after.player.hp).toBe(s.player.hp);
     expect(after.monsters[0].aggro).toBe(false);
@@ -70,6 +71,136 @@ describe('캐릭터와 이동', () => {
   });
 });
 
+describe('클릭 이동과 근접 자동 공격', () => {
+  it('클릭 이동은 순간이동하지 않고 일정 속도로 목적지에서 멈춘다', () => {
+    const initial = game(); initial.monsters = [];
+    let s = applyAction(initial, { type: 'moveTo', x: SPAWN.x + 75, y: SPAWN.y }, START);
+    expect(s.player.x).toBe(SPAWN.x);
+    expect(s.moveDestination).toEqual({ x: SPAWN.x + 75, y: SPAWN.y });
+    s = tick(s);
+    expect(s.player.x - initial.player.x).toBeCloseTo(PLAYER_SPEED * .2);
+    s = tick(s, 2);
+    expect(s.player.x).toBeCloseTo(SPAWN.x + 75);
+    expect(s.moveDestination).toBeNull(); expect(s.movePath).toEqual([]);
+    expect(tick(s, 5).player.x).toBe(s.player.x);
+  });
+  it('바위를 우회하는 경로 전체에서 충돌하지 않고 목적지에 도착한다', () => {
+    let s = game(); s.monsters = []; s.player.x = 300; s.player.y = 250;
+    s = applyAction(s, { type: 'moveTo', x: 420, y: 250 }, START);
+    expect(s.movePath!.length).toBeGreaterThan(1);
+    expect(s.movePath!.length).toBeLessThanOrEqual(200);
+    for (let i = 0; s.moveDestination && i < 50; i++) {
+      const previous = { x: s.player.x, y: s.player.y };
+      s = tick(s);
+      expect(collides(s.player.x, s.player.y, 13, s.zone)).toBe(false);
+      expect(Math.hypot(s.player.x - previous.x, s.player.y - previous.y)).toBeLessThanOrEqual(30.000001);
+    }
+    expect(s.moveDestination).toBeNull();
+    expect(s.player.x).toBeCloseTo(420); expect(s.player.y).toBeCloseTo(250);
+  });
+  it('장애물 클릭은 근처 빈 땅을 선택하고 잘못된 좌표는 거부한다', () => {
+    let s = game(); s.monsters = [];
+    s = applyAction(s, { type: 'moveTo', x: 360, y: 250 }, START);
+    const destination = s.moveDestination!;
+    expect(destination).not.toEqual({ x: 360, y: 250 });
+    expect(collides(destination.x, destination.y, 13, s.zone)).toBe(false);
+    for (const point of [{ x: NaN, y: 1 }, { x: 1, y: Infinity }, { x: -1, y: 1 }, { x: 1601, y: 1 }, { x: 1, y: 1041 }]) {
+      expect(() => validateAction({ type: 'moveTo', ...point })).toThrow();
+    }
+  });
+  it('새 클릭으로 목적지를 교체하고 수동 이동은 같은 시각에도 경로를 취소한다', () => {
+    let s = game(); s.monsters = [];
+    s = applyAction(s, { type: 'moveTo', x: 600, y: 510 }, START);
+    s = applyAction(s, { type: 'moveTo', x: 220, y: 570 }, START);
+    expect(s.moveDestination).toEqual({ x: 220, y: 570 });
+    s = applyAction(s, { type: 'tick', dx: -1, dy: 0 }, START);
+    expect(s.moveDestination).toBeNull(); expect(s.movePath).toEqual([]);
+    expect(tick(s).player.x).toBe(SPAWN.x);
+    s = applyAction(s, { type: 'moveTo', x: 600, y: 510 }, s.time);
+    s = applyAction(s, { type: 'tick', dx: -1, dy: 0 }, s.time + 200);
+    expect(s.player.x).toBe(SPAWN.x - 30); expect(s.moveDestination).toBeNull();
+  });
+  it('몬스터 선택과 지역 이동은 클릭 이동을 취소한다', () => {
+    const initial = prepared();
+    const walking = applyAction(initial, { type: 'moveTo', x: 700, y: 510 }, START);
+    const targeting = applyAction(walking, { type: 'target', id: initial.monsters[0].id }, START);
+    expect(targeting.moveDestination).toBeNull(); expect(targeting.movePath).toEqual([]);
+    expect(targeting.targetId).toBe(initial.monsters[0].id);
+    for (const zone of ['island', 'tower'] as const) {
+      const traveling = applyAction(walking, { type: 'travel', zone }, START);
+      expect(traveling.moveDestination).toBeNull(); expect(traveling.movePath).toEqual([]);
+      expect(traveling.targetId).toBeNull();
+    }
+  });
+  it('클릭 이동 중 사망하면 부활 지점에서 경로를 버린다', () => {
+    let s = prepared('volcano'); s.player.hp = 1;
+    s = applyAction(s, { type: 'moveTo', x: 700, y: 510 }, START);
+    s = tick(s);
+    expect(s.zone).toBe('island'); expect({ x: s.player.x, y: s.player.y }).toEqual(SPAWN);
+    expect(s.moveDestination).toBeNull(); expect(s.movePath).toEqual([]);
+  });
+  it('의도적인 클릭·키보드 이동 중에는 근처 몬스터를 자동 공격하지 않는다', () => {
+    const initial = prepared();
+    const clicked = tick(applyAction(initial, { type: 'moveTo', x: 600, y: 510 }, START));
+    const keyboard = applyAction(initial, { type: 'tick', dx: 1, dy: 0 }, START + 200);
+    for (const after of [clicked, keyboard]) {
+      expect(after.targetId).toBeNull();
+      expect(after.monsters[0].hp).toBe(initial.monsters[0].hp);
+      expect(after.monsters[0].aggro).toBe(false);
+    }
+  });
+  it.each(['knight', 'elf'] as const)('%s는 선택 없이 58px 이내의 살아 있는 몬스터를 자동 공격한다', characterClass => {
+    const initial = prepared(); initial.player.class = characterClass;
+    const after = tick(initial);
+    expect(after.targetId).toBe(initial.monsters[0].id);
+    expect(after.monsters[0].hp).toBeLessThan(initial.monsters[0].hp);
+  });
+  it.each(['ifrit', 'phoenix'] as const)('%s가 자신의 사거리에서 공격하면 가만히 있던 기사도 반격한다', kind => {
+    const initial = prepared('volcano', 75, 7);
+    const monster = initial.monsters[0];
+    monster.kind = kind; monster.hp = monster.maxHp = MONSTERS[kind].hp;
+    monster.x = monster.homeX = initial.player.x + MONSTERS[kind].range;
+    monster.aggro = true;
+    const after = tick(initial, 3);
+    expect(after.targetId).toBe(monster.id);
+    expect(after.monsters[0].hp).toBeLessThan(monster.hp);
+    const walking = applyAction(initial, { type: 'tick', dx: -1, dy: 0 }, START + 200);
+    expect(walking.targetId).toBeNull();
+    expect(walking.monsters[0].hp).toBe(monster.hp);
+  });
+  it('요정의 210px 사거리까지 자동 탐색하지 않으며 기존 목표는 계속 공격한다', () => {
+    let s = prepared(); s.player.class = 'elf';
+    s.monsters[0].x = s.monsters[0].homeX = s.player.x + 150;
+    const idle = tick(s);
+    expect(idle.targetId).toBeNull(); expect(idle.monsters[0].hp).toBe(s.monsters[0].hp);
+    s = applyAction(s, { type: 'target', id: s.monsters[0].id }, START);
+    const selected = tick(s);
+    expect(selected.targetId).toBe(s.monsters[0].id);
+    expect(selected.monsters[0].hp).toBeLessThan(s.monsters[0].hp);
+  });
+  it('자동 목표는 공격 중인 적을 우선하고 같은 조건이면 가장 가까운 적을 고른다', () => {
+    const initial = game(); initial.monsters = initial.monsters.slice(0, 3);
+    initial.monsters.forEach((m, index) => {
+      m.x = m.homeX = initial.player.x + 20 + index * 15; m.y = m.homeY = initial.player.y;
+      m.nextAttackAt = START + 10000;
+    });
+    expect(tick(initial).targetId).toBe(initial.monsters[0].id);
+    initial.monsters[2].aggro = true;
+    expect(tick(initial).targetId).toBe(initial.monsters[2].id);
+    initial.monsters[2].alive = false; initial.monsters[2].respawnAt = START + 10000;
+    expect(tick(initial).targetId).toBe(initial.monsters[0].id);
+  });
+  it('기존 저장본은 이동 필드 없이 호환되며 저장한 경로는 재접속 후 이어진다', () => {
+    const old = game(); old.monsters = [];
+    delete old.moveDestination; delete old.movePath;
+    const loaded = tick(JSON.parse(JSON.stringify(old)) as GameState);
+    expect(loaded.moveDestination).toBeNull(); expect(loaded.movePath).toEqual([]);
+    const walking = applyAction(loaded, { type: 'moveTo', x: 600, y: 510 }, loaded.time);
+    const resumed = tick(JSON.parse(JSON.stringify(walking)) as GameState);
+    expect(resumed.player.x).toBeCloseTo(250); expect(resumed.moveDestination).toEqual(walking.moveDestination);
+  });
+});
+
 describe('보상·레벨·사망', () => {
   it.each(['island', 'temple', 'volcano', 'tower'] as const)('%s 보상 범위와 주문서 판정, 중복 보상 방지', zone => {
     let s = prepared(zone, 60, 9);
@@ -78,13 +209,23 @@ describe('보상·레벨·사망', () => {
     s = applyAction(s, { type: 'target', id: s.monsters[0].id }, s.time);
     s = tick(s, 3, () => 0);
     expect(s.player.adena - before.adena).toBe(ZONES[zone].adena[0]);
-    expect(s.player.xp - before.xp).toBe(ZONES[zone].xp[0]);
+    expect(s.player.xp - before.xp).toBe(ZONES[zone].xp[0] * XP_MULTIPLIER);
     expect(s.player.scrolls).toBe(before.scrolls + 1);
     expect(s.monsters[0].alive).toBe(false);
     const paid = s.player.adena;
     s = tick(s, 10, () => 0);
     expect(s.player.adena).toBe(paid);
     expect(() => applyAction(s, { type: 'target', id: s.monsters[0].id }, s.time)).toThrow();
+  });
+  it.each(['island', 'temple', 'volcano', 'tower'] as const)('%s의 실제 경험치 추첨값에 정확히 3배를 적용하고 로그에 표시한다', zone => {
+    for (const sample of [0, .5, 1 - Number.EPSILON]) {
+      const initial = prepared(zone, 60, 9); initial.monsters[0].hp = 1;
+      const after = tick(initial, 3, () => sample);
+      const [minimum, maximum] = ZONES[zone].xp;
+      const expected = (minimum + Math.floor(sample * (maximum - minimum + 1))) * 3;
+      expect(after.player.xp - initial.player.xp).toBe(expected);
+      expect(after.logs.some(entry => entry.kind === 'reward' && entry.text.includes(`경험치 ${expected} ·`))).toBe(true);
+    }
   });
   it('드롭 확률 경계값을 실제 개별 처치에 적용한다', () => {
     for (const sample of [0.049, 0.05]) {
@@ -203,17 +344,25 @@ describe('누적 몬스터 처치 수와 재생성 보존', () => {
 });
 
 describe('강화·입장·방어구', () => {
-  it('모든 강화 확률 경계값을 적용하고 실패 시 정확히 +3으로 돌아간다', () => {
+  it('안전 강화 +4까지 항상 성공하고 이후 모든 확률 경계와 단계별 실패 하락을 적용한다', () => {
+    expect(ENHANCE_CHANCES).toEqual([1, 1, 1, 1, .95, .70, .50, .30, .19, .10]);
+    expect(ENHANCE_FAILURE_LEVELS).toEqual([0, 1, 2, 3, 3, 4, 5, 6, 7, 8]);
     for (let enhancement = 0; enhancement < 10; enhancement++) {
       const s = game(); s.player.enhancement = enhancement;
       const success = applyAction(s, { type: 'enhance' }, START, () => ENHANCE_CHANCES[enhancement] - 0.0001);
       expect(success.player.enhancement).toBe(enhancement + 1);
       expect(success.player.scrolls).toBe(s.player.scrolls - 1);
-      if (enhancement >= 3) {
+      if (enhancement < 4) {
+        for (const sample of [0, .5, 1 - Number.EPSILON]) {
+          expect(applyAction(s, { type: 'enhance' }, START, () => sample).player.enhancement).toBe(enhancement + 1);
+        }
+      } else {
         const failed = applyAction(s, { type: 'enhance' }, START, () => ENHANCE_CHANCES[enhancement]);
-        expect(failed.player.enhancement).toBe(3);
+        expect(failed.player.enhancement).toBe(enhancement - 1);
         expect(failed.player.scrolls).toBe(s.player.scrolls - 1);
         expect(failed.player.adena).toBe(s.player.adena);
+        expect(failed.logs.at(-1)?.text).toContain(`+${enhancement - 1}`);
+        expect(failed.effects.at(-1)?.value).toBe(enhancement - 1);
       }
     }
   });
@@ -223,7 +372,7 @@ describe('강화·입장·방어구', () => {
     s = applyAction(s, { type: 'enhance' }, START, () => 0.99);
     expect(stats(s.player).defense).toBeLessThan(before);
     expect(s.player.bestEnhancement).toBe(9);
-    expect(power(s.player)).toBe(3100);
+    expect(power(s.player)).toBe(8100);
   });
   it('주문서 부족 및 +10 초과 강화를 거부한다', () => {
     let s = game(); s.player.scrolls = 0;
@@ -232,12 +381,16 @@ describe('강화·입장·방어구', () => {
     expect(() => applyAction(s, { type: 'enhance' }, START)).toThrow('+10');
     expect(s.player.scrolls).toBe(8);
   });
-  it('상위 지역 입장 제한과 강화 실패 시 강제 귀환', () => {
-    expect(() => applyAction(game(), { type: 'travel', zone: 'temple' }, START)).toThrow('+6');
+  it.each(['island', 'temple', 'volcano', 'tower'] as const)('+0 무기로 %s에 자유롭게 입장한다', zone => {
+    expect(applyAction(game(), { type: 'travel', zone }, START).zone).toBe(zone);
+  });
+  it('강화 실패 후에도 현재 사냥터와 위치를 유지한다', () => {
     let s = prepared('tower', 90, 9);
+    s.player.x += 120;
+    const point = { x: s.player.x, y: s.player.y };
     s = applyAction(s, { type: 'enhance' }, START, () => 0.9);
-    expect(s.zone).toBe('island'); expect(s.player.x).toBe(SPAWN.x);
-    expect(s.player.enhancement).toBe(3);
+    expect(s.zone).toBe('tower'); expect({ x: s.player.x, y: s.player.y }).toEqual(point);
+    expect(s.player.enhancement).toBe(8);
   });
   it.each(['knight', 'elf'] as const)('+10 %s 무기의 10%% 특수 공격이 주변 대상에 피해를 준다', characterClass => {
     let s = game(characterClass); s.player.enhancement = 10; s.player.level = 90;
@@ -263,6 +416,7 @@ describe('물약과 경제', () => {
   });
   it('HP 80% 이하에서만 자동 사용하고 초당 최대 1개 소모', () => {
     let s = prepared(); s.player.autoPotion.enabled = true;
+    s.monsters = [];
     s.player.hp = stats(s.player).maxHp * 0.8 + 1;
     expect(tick(s).player.potions.red).toBe(25);
     s.player.hp = stats(s.player).maxHp * 0.8;
@@ -276,6 +430,45 @@ describe('물약과 경제', () => {
     s.player.hp = stats(s.player).maxHp - 1; s.player.potions.clear = 1;
     s = applyAction(s, { type: 'usePotion', kind: 'clear' }, s.time + 1000);
     expect(s.player.hp).toBe(stats(s.player).maxHp);
+  });
+  it('네 종류 중 선택한 한 물약만 자동으로 사용한다', () => {
+    let s = game(); s.monsters = []; s.player.hp = 10;
+    s.player.potions.clear = 2; s.player.potions.green = 2;
+    const kinds = ['red', 'orange', 'clear', 'green'] as const;
+    for (const kind of kinds) {
+      s.player.hp = 10; s.player.greenUntil = 0;
+      s = applyAction(s, { type: 'autoPotion', enabled: true, kind }, s.time);
+      expect(s.player.autoPotion).toEqual({ enabled: true, kind });
+      const before = { ...s.player.potions };
+      s = tick(s, 5);
+      for (const other of kinds) expect(s.player.potions[other]).toBe(before[other] - Number(other === kind));
+    }
+  });
+  it('초록 자동 물약은 체력과 무관하게 만료 후 사용하고 활성 효과를 갱신하지 않는다', () => {
+    let s = game(); s.monsters = []; s.player.potions.green = 3;
+    s = applyAction(s, { type: 'autoPotion', enabled: true, kind: 'green' }, START);
+    s = tick(s);
+    const expires = s.player.greenUntil;
+    const usedAt = s.logs.find(entry => entry.text.startsWith('초록 물약:'))!.time;
+    expect(expires).toBe(usedAt + GREEN_DURATION);
+    expect(s.player.potions.green).toBe(2);
+    s = tick(s, 20);
+    expect(s.player.potions.green).toBe(2); expect(s.player.greenUntil).toBe(expires);
+    s = applyAction(s, { type: 'tick', dx: 0, dy: 0 }, expires - 100);
+    expect(s.player.potions.green).toBe(2); expect(s.player.greenUntil).toBe(expires);
+    s = applyAction(s, { type: 'tick', dx: 0, dy: 0 }, expires);
+    expect(s.player.potions.green).toBe(1); expect(s.player.greenUntil).toBe(expires + GREEN_DURATION);
+    expect(s.logs.filter(entry => entry.text === '초록 물약 효과가 종료되었습니다.')).toHaveLength(1);
+  });
+  it('빈 초록 물약은 활성 효과가 끝났을 때 알림을 한 번 남기고 자동 사용을 끈다', () => {
+    let s = game(); s.monsters = []; s.player.potions.green = 0; s.player.greenUntil = START + 1000;
+    s = applyAction(s, { type: 'autoPotion', enabled: true, kind: 'green' }, START);
+    s = tick(s, 4);
+    expect(s.player.autoPotion.enabled).toBe(true); expect(s.player.greenUntil).toBe(START + 1000);
+    s = tick(s);
+    expect(s.player.autoPotion.enabled).toBe(false); expect(s.player.greenUntil).toBe(0);
+    s = tick(s, 10);
+    expect(s.logs.filter(entry => entry.text.includes('초록 물약') && entry.text.includes('모두 소진'))).toHaveLength(1);
   });
   it('초록 물약은 서버 시각 10분, 재사용 시 갱신하며 30초 경고·만료를 처리', () => {
     let s = applyAction(game(), { type: 'usePotion', kind: 'green' }, START);

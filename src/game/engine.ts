@@ -1,5 +1,6 @@
-import { ARMOR_BONUS, ATTACK_BONUS, ATTACK_INTERVAL, AUTO_POTION_THRESHOLD, CLASSES, ENHANCE_CHANCES, GREEN_DURATION, MAX_ENHANCEMENT, MAX_LEVEL, MAX_TICK_MS, MONSTERS, PLAYER_RADIUS, PLAYER_SPEED, POTION_INTERVAL, POTIONS, RESPAWN_MS, XP_TABLE, ZONES } from './config';
-import type { Action, CharacterClass, EffectKind, GameLog, GameState, HealPotionKind, Monster, Player, Point, PotionKind, ZoneId } from './types';
+import { ARMOR_BONUS, ATTACK_BONUS, ATTACK_INTERVAL, AUTO_ATTACK_RANGE, AUTO_POTION_THRESHOLD, CLASSES, ENHANCE_CHANCES, ENHANCE_FAILURE_LEVELS, GREEN_DURATION, MAX_ENHANCEMENT, MAX_LEVEL, MAX_TICK_MS, MONSTERS, PLAYER_RADIUS, PLAYER_SPEED, POTION_INTERVAL, POTIONS, RESPAWN_MS, WORLD_HEIGHT, WORLD_WIDTH, XP_MULTIPLIER, XP_TABLE, ZONES } from './config';
+import type { Action, CharacterClass, EffectKind, GameLog, GameState, Monster, Player, Point, PotionKind, ZoneId } from './types';
+import { findPath, isPathClear, MAX_NAVIGATION_POINTS } from './navigation';
 import { collides, SPAWN, spawnMonsters } from './world';
 
 export function xpRequired(level: number): number { return XP_TABLE[level] ?? 0; }
@@ -38,7 +39,7 @@ export function createGame(nickname: string, characterClass: CharacterClass, now
     potions: { red: 25, orange: 10, clear: 0, green: 1 },
     autoPotion: { enabled: true, kind: 'red' }, greenUntil: 0,
   };
-  const s: GameState = { version: 1, player, monsters: spawnMonsters('island'), zone: 'island', time: now, targetId: null, nextAttackAt: now, nextPotionAt: now, greenWarningSent: false, sequence: 0, logs: [], effects: [], zoneMonsters: {} };
+  const s: GameState = { version: 1, player, monsters: spawnMonsters('island'), zone: 'island', time: now, targetId: null, nextAttackAt: now, nextPotionAt: now, greenWarningSent: false, sequence: 0, logs: [], effects: [], zoneMonsters: {}, moveDestination: null, movePath: [] };
   log(s, `${nickname}님, 말하는 섬에 오신 것을 환영합니다.`, 'success');
   log(s, '모험 지원품: 아데나 2,000 · 주문서 8장 · 빨강 25 · 주홍 10 · 초록 1');
   return s;
@@ -52,6 +53,9 @@ export function validateAction(input: unknown): Action {
     case 'tick':
       if (typeof a.dx !== 'number' || typeof a.dy !== 'number' || !Number.isFinite(a.dx) || !Number.isFinite(a.dy) || Math.abs(a.dx) > 1 || Math.abs(a.dy) > 1) throw new Error('이동 방향이 올바르지 않습니다.');
       return { type: 'tick', dx: a.dx, dy: a.dy };
+    case 'moveTo':
+      if (typeof a.x !== 'number' || typeof a.y !== 'number' || !Number.isFinite(a.x) || !Number.isFinite(a.y) || a.x < 0 || a.x > WORLD_WIDTH || a.y < 0 || a.y > WORLD_HEIGHT) throw new Error('이동 목적지가 올바르지 않습니다.');
+      return { type: 'moveTo', x: a.x, y: a.y };
     case 'target':
       if (typeof a.id !== 'string' || a.id.length > 60) throw new Error('대상이 올바르지 않습니다.');
       return { type: 'target', id: a.id };
@@ -66,8 +70,8 @@ export function validateAction(input: unknown): Action {
       if (typeof a.kind !== 'string' || !potionKinds.includes(a.kind)) throw new Error('존재하지 않는 물약입니다.');
       return { type: 'usePotion', kind: a.kind as PotionKind };
     case 'autoPotion':
-      if (typeof a.enabled !== 'boolean' || typeof a.kind !== 'string' || !['red', 'orange', 'clear'].includes(a.kind)) throw new Error('자동 물약 설정이 올바르지 않습니다.');
-      return { type: 'autoPotion', enabled: a.enabled, kind: a.kind as HealPotionKind };
+      if (typeof a.enabled !== 'boolean' || typeof a.kind !== 'string' || !potionKinds.includes(a.kind)) throw new Error('자동 물약 설정이 올바르지 않습니다.');
+      return { type: 'autoPotion', enabled: a.enabled, kind: a.kind as PotionKind };
     default: throw new Error('지원하지 않는 명령입니다.');
   }
 }
@@ -87,8 +91,30 @@ function move(point: Point, dx: number, dy: number, speed: number, dt: number, z
     if (!collides(point.x, point.y + sy, radius, zone)) point.y += sy;
   }
 }
+function cancelMovement(s: GameState) {
+  s.moveDestination = null;
+  s.movePath = [];
+}
+function followPath(s: GameState, dt: number) {
+  const path = s.movePath ?? [];
+  let remaining = PLAYER_SPEED * dt / 1000;
+  while (path.length && remaining > 0) {
+    const waypoint = path[0], gap = distance(s.player, waypoint);
+    if (gap < 0.000001) { path.shift(); continue; }
+    const step = Math.min(8, remaining, gap);
+    const x = s.player.x + (waypoint.x - s.player.x) / gap * step;
+    const y = s.player.y + (waypoint.y - s.player.y) / gap * step;
+    // 계산된 선분을 따라 이동하며, 벽에 부딪히면 미끄러져 경로를 벗어나지 않습니다.
+    if (!isPathClear(s.player, { x, y }, s.zone)) { cancelMovement(s); return; }
+    s.player.x = x; s.player.y = y;
+    remaining -= step;
+    if (step === gap) path.shift();
+  }
+  if (!path.length) cancelMovement(s);
+}
 function usePotion(s: GameState, kind: PotionKind, automatic = false): boolean {
   const p = s.player;
+  if (automatic && kind === 'green' && p.greenUntil > s.time) return false;
   if (s.time < s.nextPotionAt) {
     if (automatic) return false;
     throw new Error('물약은 1초에 한 번 사용할 수 있습니다.');
@@ -132,6 +158,7 @@ function changeZone(s: GameState, zone: ZoneId) {
   }
   s.player.x = SPAWN.x; s.player.y = SPAWN.y;
   s.targetId = null;
+  cancelMovement(s);
   s.nextAttackAt = s.time + 400;
   log(s, `${ZONES[zone].name}(으)로 이동했습니다.`);
 }
@@ -164,7 +191,7 @@ function kill(s: GameState, m: Monster, rng: () => number) {
   effect(s, 'death', m, { text: MONSTERS[m.kind].name });
   const zone = ZONES[s.zone];
   const adena = randomInt(...zone.adena, rng);
-  const xp = s.player.level >= MAX_LEVEL ? 0 : randomInt(...zone.xp, rng);
+  const xp = s.player.level >= MAX_LEVEL ? 0 : randomInt(...zone.xp, rng) * XP_MULTIPLIER;
   s.player.adena += adena;
   grantXp(s, xp);
   const scroll = rng() < zone.scrollChance;
@@ -218,12 +245,24 @@ function tick(s: GameState, action: Extract<Action, { type: 'tick' }>, dt: numbe
     effect(s, 'respawn', m);
   }
   const manualMove = action.dx !== 0 || action.dy !== 0;
+  const clickMove = !!s.moveDestination && !!s.movePath?.length;
   if (manualMove) {
     s.targetId = null;
+    cancelMovement(s);
     move(p, action.dx, action.dy, PLAYER_SPEED, dt, s.zone);
+  } else if (clickMove) {
+    s.targetId = null;
+    followPath(s, dt);
   }
-  const target = s.monsters.find(m => m.id === s.targetId && m.alive);
-  if (target) {
+  let target = s.monsters.find(m => m.id === s.targetId && m.alive);
+  if (!target) s.targetId = null;
+  if (!manualMove && !clickMove && !target) {
+    target = s.monsters.filter(m => m.alive && (distance(p, m) <= AUTO_ATTACK_RANGE
+      || (m.aggro && distance(p, m) <= MONSTERS[m.kind].range + 2)))
+      .sort((a, b) => Number(b.aggro) - Number(a.aggro) || distance(p, a) - distance(p, b))[0];
+    if (target) s.targetId = target.id;
+  }
+  if (target && !manualMove && !clickMove) {
     if (distance(p, target) > stats(p).range) move(p, target.x - p.x, target.y - p.y, PLAYER_SPEED, Math.min(dt, (distance(p, target) - stats(p).range + 2) / PLAYER_SPEED * 1000), s.zone);
     if (distance(p, target) <= stats(p).range + 2 && s.time >= s.nextAttackAt) attack(s, target, rng);
   }
@@ -248,7 +287,9 @@ function tick(s: GameState, action: Extract<Action, { type: 'tick' }>, dt: numbe
       if (distance(m, destination) > 4) move(m, destination.x - m.x, destination.y - m.y, spec.speed * 0.28, dt, s.zone, 12);
     }
   }
-  if (p.autoPotion.enabled && p.hp <= stats(p).maxHp * AUTO_POTION_THRESHOLD) usePotion(s, p.autoPotion.kind, true);
+  if (p.autoPotion.enabled && (p.autoPotion.kind === 'green'
+    ? p.greenUntil <= s.time
+    : p.hp <= stats(p).maxHp * AUTO_POTION_THRESHOLD)) usePotion(s, p.autoPotion.kind, true);
   return true;
 }
 
@@ -275,6 +316,12 @@ export function applyAction(previous: GameState, input: Action, now: number, rng
   // 이전 저장본에는 누적 처치 필드가 없으므로 첫 명령에서 안전하게 추가합니다.
   s.player.kills ??= 0;
   s.zoneMonsters ??= {};
+  s.moveDestination ??= null;
+  s.movePath ??= [];
+  if (action.type === 'tick' && (action.dx !== 0 || action.dy !== 0)) {
+    s.targetId = null;
+    cancelMovement(s);
+  }
   const elapsed = now - s.time;
   if (action.type === 'tick' && elapsed > 0 && elapsed <= MAX_CATCH_UP_MS) {
     while (s.time < now) {
@@ -289,12 +336,26 @@ export function applyAction(previous: GameState, input: Action, now: number, rng
   switch (action.type) {
     case 'tick':
       break;
+    case 'moveTo': {
+      s.targetId = null;
+      cancelMovement(s);
+      const path = findPath(p, action, s.zone);
+      if (path === null || path.length > MAX_NAVIGATION_POINTS) {
+        log(s, '그곳으로 이동할 수 있는 길이 없습니다.', 'warning');
+      } else if (path.length) {
+        s.movePath = path;
+        s.moveDestination = { ...path[path.length - 1] };
+      }
+      break;
+    }
     case 'target':
       if (!s.monsters.some(m => m.id === action.id && m.alive)) throw new Error('이미 사라진 몬스터입니다.');
+      cancelMovement(s);
       s.targetId = action.id;
       break;
     case 'travel':
-      if (p.enhancement < ZONES[action.zone].requirement) throw new Error(`+${ZONES[action.zone].requirement} 이상 무기가 필요합니다.`);
+      s.targetId = null;
+      cancelMovement(s);
       if (action.zone === s.zone) break;
       changeZone(s, action.zone);
       break;
@@ -303,18 +364,14 @@ export function applyAction(previous: GameState, input: Action, now: number, rng
       if (p.scrolls < 1) throw new Error('무기강화주문서가 부족합니다.');
       p.scrolls--;
       const success = rng() < ENHANCE_CHANCES[p.enhancement];
-      p.enhancement = success ? p.enhancement + 1 : 3;
+      p.enhancement = success ? p.enhancement + 1 : ENHANCE_FAILURE_LEVELS[p.enhancement];
       p.bestEnhancement = Math.max(p.bestEnhancement, p.enhancement);
       if (success) {
         log(s, `+${p.enhancement} ${CLASSES[p.class].weapon} 강화에 성공했습니다!`, 'success');
         effect(s, 'enhanceSuccess', p, { value: p.enhancement, text: p.enhancement === 10 ? '전설의 +10 무기 탄생!' : `+${p.enhancement} 강화 성공!` });
       } else {
-        log(s, '무기 강화에 실패했습니다. 무기와 방어구가 +3으로 초기화되었습니다.', 'warning');
-        effect(s, 'enhanceFail', p, { value: 3 });
-      }
-      if (p.enhancement < ZONES[s.zone].requirement) {
-        log(s, '사냥터 입장 조건을 충족하지 못해 말하는 섬으로 귀환합니다.', 'warning');
-        changeZone(s, 'island');
+        log(s, `무기 강화에 실패했습니다. 무기와 방어구가 +${p.enhancement}(으)로 하락했습니다.`, 'warning');
+        effect(s, 'enhanceFail', p, { value: p.enhancement });
       }
       break;
     }

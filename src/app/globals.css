@@ -5,3 +5,13 @@
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
 
 .save-status{display:block;font-size:10px;color:#9ab88a;font-variant-numeric:tabular-nums}.save-status.failed{color:#e6b27f}.header-actions .save-button{border:1px solid #766942;border-radius:3px;padding:5px 10px;color:#dfcd99}.save-conflict{padding:14px;border:1px solid #987447;background:#292519;display:flex;align-items:center;justify-content:space-between;gap:12px;margin:10px 0}.save-conflict p{font-size:12px}
+
+/* 전투 화면 바로 아래의 모험 기록과 단일 자동 물약 선택 표시 */
+.world-frame .log-panel{margin:0;border:0;border-top:1px solid #3d4b32}
+.world-frame .log-heading{justify-content:flex-start;gap:12px}
+.world-frame .log-content{height:92px;padding:7px 12px}
+.world-frame .log-panel.compact .log-content{height:36px}
+.quick-potions button.auto-selected{border:2px solid #f0d98d;background:#2a341b;animation:auto-potion-glow 1.8s ease-in-out infinite}
+.quick-potions button.auto-selected::after{content:'AUTO';position:absolute;top:3px;right:2px;font-size:7px;line-height:1;color:#ffe8a0;letter-spacing:.3px}
+@keyframes auto-potion-glow{0%,100%{box-shadow:inset 0 0 7px #dfc66c55,0 0 5px #dfc66c55}50%{box-shadow:inset 0 0 13px #ffe49b99,0 0 13px #e7cd7b99}}
+@media(prefers-reduced-motion:reduce){.quick-potions button.auto-selected{animation:none;box-shadow:0 0 8px #e7cd7b99}}

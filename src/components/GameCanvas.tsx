@@ -12,6 +12,7 @@ export interface GameCanvasProps {
   state: GameState;
   onTarget: (id: string) => void;
   onMove: (dx: number, dy: number) => void;
+  onMoveTo: (x: number, y: number) => void;
   paused?: boolean;
 }
 const WIDTH = 1000;
@@ -59,12 +60,12 @@ function drawEffect(ctx: CanvasRenderingContext2D, e: Effect, now: number) {
   ctx.restore();
 }
 
-export default function GameCanvas({state,onTarget,onMove,paused=false}:GameCanvasProps) {
+export default function GameCanvas({state,onTarget,onMove,onMoveTo,paused=false}:GameCanvasProps) {
   const canvasRef=useRef<HTMLCanvasElement>(null);
-  const stateRef=useRef(state), targetRef=useRef(onTarget), moveRef=useRef(onMove), pausedRef=useRef(paused);
+  const stateRef=useRef(state), targetRef=useRef(onTarget), moveRef=useRef(onMove), moveToRef=useRef(onMoveTo), pausedRef=useRef(paused);
   const receivedRef=useRef(0),cameraRef=useRef({x:0,y:0});
   const visualsRef=useRef<Map<string,Point>>(new Map());
-  stateRef.current=state;targetRef.current=onTarget;moveRef.current=onMove;pausedRef.current=paused;
+  stateRef.current=state;targetRef.current=onTarget;moveRef.current=onMove;moveToRef.current=onMoveTo;pausedRef.current=paused;
   useEffect(()=>{receivedRef.current=performance.now();},[state]);
   useEffect(()=>{if(paused)moveRef.current(0,0);},[paused]);
 
@@ -105,6 +106,12 @@ export default function GameCanvas({state,onTarget,onMove,paused=false}:GameCanv
         if(d.kind==='flower'){ctx.fillStyle='#91a56e';ctx.fillRect(d.x,d.y-4,1,6);ctx.fillStyle='#d7bd8d';ctx.fillRect(d.x-1,d.y-6,3,3);}
         if(d.kind==='bones'){ctx.fillStyle='#8c827055';ctx.fillRect(d.x,d.y,10,2);ctx.fillRect(d.x-1,d.y-2,3,5);ctx.fillRect(d.x+8,d.y-2,3,5);}
         if(d.kind==='rune'){ctx.strokeStyle='#b29c6933';ctx.lineWidth=1;ctx.strokeRect(d.x-5,d.y-3,10,6);ctx.beginPath();ctx.moveTo(d.x-8,d.y);ctx.lineTo(d.x+8,d.y);ctx.stroke();}
+      }
+      if(s.moveDestination){
+        const destination=s.moveDestination;const pulse=1+Math.sin(now*.006)*.12;
+        ctx.save();ctx.translate(destination.x,destination.y);ctx.strokeStyle='#e4cf8a';ctx.lineWidth=2;ctx.globalAlpha=.8;
+        ctx.beginPath();ctx.ellipse(0,0,13*pulse,6*pulse,0,0,Math.PI*2);ctx.stroke();
+        ctx.beginPath();ctx.moveTo(-4,0);ctx.lineTo(4,0);ctx.moveTo(0,-3);ctx.lineTo(0,3);ctx.stroke();ctx.restore();
       }
       const entities:{depth:number;draw:()=>void}[]=[];
       objects.forEach(o=>entities.push({depth:o.y+o.height/2,draw:()=>drawObject(ctx,{x:o.x-o.width/2,y:o.y-o.height/2,w:o.width,h:o.height,kind:o.kind},s.zone,now)}));
@@ -152,14 +159,14 @@ export default function GameCanvas({state,onTarget,onMove,paused=false}:GameCanv
   },[]);
 
   return <canvas ref={canvasRef} width={WIDTH} height={HEIGHT} tabIndex={0} role="img"
-    aria-label={`${ZONES[state.zone].name} 사냥터. WASD 또는 방향키로 이동하고 몬스터를 클릭하여 공격하세요.`}
+    aria-label={`${ZONES[state.zone].name} 사냥터. 땅을 클릭하거나 WASD 또는 방향키로 이동하고 몬스터를 클릭하여 공격하세요.`}
     data-testid="game-canvas"
     style={{display:'block',width:'100%',height:'auto',aspectRatio:`${WIDTH} / ${HEIGHT}`,imageRendering:'pixelated',outline:'none',cursor:paused?'default':'crosshair',background:'#111d17'}}
     onPointerDown={event=>{
-      if(pausedRef.current)return;event.currentTarget.focus();
+      if(pausedRef.current||event.button!==0)return;event.currentTarget.focus();
       const rect=event.currentTarget.getBoundingClientRect();const x=(event.clientX-rect.left)/rect.width*WIDTH+cameraRef.current.x,y=(event.clientY-rect.top)/rect.height*HEIGHT+cameraRef.current.y;
       let nearest:string|null=null,distance=45;
       for(const m of stateRef.current.monsters){if(!m.alive)continue;const visual=visualsRef.current.get(m.id)??m;const d=Math.hypot(visual.x-x,(visual.y-21-y)*.85);if(d<distance){distance=d;nearest=m.id;}}
-      if(nearest)targetRef.current(nearest);
+      if(nearest)targetRef.current(nearest);else moveToRef.current(x,y);
     }} />;
 }

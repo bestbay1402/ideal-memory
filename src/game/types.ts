@@ -10,7 +10,7 @@ export interface Player extends Point {
   /** 모든 사냥터의 누적 처치 수. 사망·이동·재접속으로 초기화하지 않습니다. */
   kills: number;
   potions: Record<PotionKind, number>;
-  autoPotion: { enabled: boolean; kind: HealPotionKind };
+  autoPotion: { enabled: boolean; kind: PotionKind };
   greenUntil: number;
 }
 export interface Monster extends Point {
@@ -27,14 +27,18 @@ export interface GameState {
   greenWarningSent: boolean; sequence: number; logs: GameLog[]; effects: Effect[];
   /** 떠난 지역의 몬스터 생명 주기를 보관해 지역 이동으로 재생성을 우회하지 못합니다. */
   zoneMonsters?: Partial<Record<ZoneId, Monster[]>>;
+  /** 클릭 이동의 최종 목적지와 시작점을 제외한 최대 200개의 경로점입니다. */
+  moveDestination?: Point | null;
+  movePath?: Point[];
 }
 export type Action =
   | { type: 'tick'; dx: number; dy: number }
+  | { type: 'moveTo'; x: number; y: number }
   | { type: 'target'; id: string }
   | { type: 'travel'; zone: ZoneId }
   | { type: 'enhance' }
   | { type: 'buy'; kind: PotionKind; quantity: number }
   | { type: 'usePotion'; kind: PotionKind }
-  | { type: 'autoPotion'; enabled: boolean; kind: HealPotionKind };
+  | { type: 'autoPotion'; enabled: boolean; kind: PotionKind };
 export interface Obstacle extends Point { width: number; height: number; kind: 'tree' | 'rock' | 'pillar' | 'wall' | 'lava' }
 export interface Decoration extends Point { kind: 'grass' | 'flower' | 'torch' | 'bones' | 'rune' | 'sign' }

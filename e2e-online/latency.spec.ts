@@ -118,20 +118,19 @@ async function moveRight(page: Page, distance = 40) {
   await page.keyboard.up('d');
   return visualPosition(page);
 }
-async function selectNearbyMonster(page: Page, state: GameState) {
-  const monster = state.monsters[0];
+async function clickGround(page: Page, destination: { x: number; y: number }) {
   const position = await visualPosition(page);
   const cameraX = Math.min(600, Math.max(0, position.x - 500));
   const cameraY = Math.min(440, Math.max(0, position.y - 300));
   const canvas = page.getByTestId('game-canvas');
   const rect = (await canvas.boundingBox())!;
   await canvas.click({ position: {
-    x: (monster.x - cameraX) / 1000 * rect.width,
-    y: (monster.y - cameraY - 21) / 600 * rect.height,
+    x: (destination.x - cameraX) / 1000 * rect.width,
+    y: (destination.y - cameraY) / 600 * rect.height,
   } });
 }
 
-test('온라인 이동·처치는 서버 응답을 기다리지 않고 실행되며 개별 전투 요청을 보내지 않는다', async ({ page }) => {
+test('온라인 근접 자동 처치·이동은 서버 응답을 기다리지 않고 개별 전투 요청도 보내지 않는다', async ({ page }) => {
   const game = await onlineGame(page, state => {
     const monster = state.monsters[0];
     monster.x = monster.homeX = state.player.x + 35;
@@ -139,10 +138,31 @@ test('온라인 이동·처치는 서버 응답을 기다리지 않고 실행되
     monster.hp = 1;
   });
   const original = game.stored();
-  await selectNearbyMonster(page, original);
+  // 화면 진입 직후 가까운 몬스터를 클릭 없이 처치해야 합니다.
   await expect(page.locator('.stats-list')).toContainText('누적 몬스터 처치1');
   await expect(page.locator('.log-content')).toContainText('슬라임 처치');
   await moveRight(page);
+  expect(game.stored()).toEqual(original);
+  expect(game.checkpoints).toHaveLength(0);
+  expect(game.forbiddenActions).toHaveLength(0);
+});
+
+test('온라인 땅 클릭 이동과 WASD 취소도 개별 서버 요청 없이 바로 반영된다', async ({ page }) => {
+  const game = await onlineGame(page);
+  const original = game.stored();
+  const start = await visualPosition(page);
+  await clickGround(page, { x: 450, y: start.y });
+  await expect.poll(async () => (await visualPosition(page)).x - start.x, { timeout: 1500 }).toBeGreaterThan(40);
+  const beforeOverride = await visualPosition(page);
+  await page.keyboard.down('w');
+  await expect.poll(async () => beforeOverride.y - (await visualPosition(page)).y, { timeout: 1500 }).toBeGreaterThan(35);
+  await page.keyboard.up('w');
+  await page.waitForTimeout(350); // 마지막 입력의 캔버스 보간이 끝날 때까지 기다립니다.
+  const stopped = await visualPosition(page);
+  await page.waitForTimeout(500);
+  const after = await visualPosition(page);
+  expect(Math.abs(after.x - stopped.x)).toBeLessThan(2);
+  expect(Math.abs(after.y - stopped.y)).toBeLessThan(2);
   expect(game.stored()).toEqual(original);
   expect(game.checkpoints).toHaveLength(0);
   expect(game.forbiddenActions).toHaveLength(0);

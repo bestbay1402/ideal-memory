@@ -7,7 +7,7 @@
  * 주홍 물약 평균 2.2~3.8개, 가속 순수익 양수, 직업 간 성장시간 차이 15% 이내 검사.
  */
 import { applyAction, createGame, stats, xpRequired } from '../src/game/engine';
-import { GROWTH_STAGES, ZONES } from '../src/game/config';
+import { GROWTH_STAGES, XP_MULTIPLIER, ZONES } from '../src/game/config';
 import type { CharacterClass, ZoneId } from '../src/game/types';
 import { spawnMonsters } from '../src/game/world';
 
@@ -47,8 +47,13 @@ function simulate(characterClass: CharacterClass, level: number, enhancement: nu
     if (s.player.kills === beforeKills) throw new Error('80초 내 처치 실패');
     const used = startPotions - s.player.potions.orange;
     const received = Math.max(0, startHp - s.player.hp + used * 70);
+    let awardedXp = s.player.xp;
+    for (let crossedLevel = level; crossedLevel < s.player.level; crossedLevel++) awardedXp += xpRequired(crossedLevel);
+    if (awardedXp < ZONES[zone].xp[0] * XP_MULTIPLIER || awardedXp > ZONES[zone].xp[1] * XP_MULTIPLIER || awardedXp % XP_MULTIPLIER !== 0) {
+      throw new Error(`${zone} 실제 처치 경험치 ${awardedXp}: ${XP_MULTIPLIER}배 보상 범위를 벗어났습니다.`);
+    }
     seconds += (s.time - startTime) / 1000 + BETWEEN_KILLS_SECONDS;
-    potions += used; damage += received; experience += s.player.xp; adena += s.player.adena - startMoney; kills++;
+    potions += used; damage += received; experience += awardedXp; adena += s.player.adena - startMoney; kills++;
     // 지역 이동/재생성 대기는 성장 목표의 순수 사냥 시간에 넣지 않습니다.
     // 다음 표본의 HP는 이어서 사용하므로 매 전투 무료 회복 효과가 없습니다.
     s.time += BETWEEN_KILLS_SECONDS * 1000;
@@ -64,22 +69,25 @@ function check(condition: boolean, message: string) {
 const growthRows: Record<string, string | number>[] = [];
 const totalHours: Record<CharacterClass, number> = { knight: 0, elf: 0 };
 for (const characterClass of ['knight', 'elf'] as const) for (const stage of GROWTH_STAGES) {
-  let predictedSeconds = 0, averageKillSeconds = 0;
+  let predictedSeconds = 0, averageKillSeconds = 0, averageXp = 0;
   for (let level = stage.from; level < stage.to; level++) {
     const observed = simulate(characterClass, level, stage.enhancement, stage.zone, true);
-    // 몬스터별 경험치 평균은 설정된 균등분포의 기대값. 시간은 엔진의 실측입니다.
-    predictedSeconds += xpRequired(level) / stage.xpPerKill * observed.seconds;
+    // 경험치와 처치 시간 모두 실제 전투 엔진에서 지급·관측한 표본을 사용합니다.
+    predictedSeconds += xpRequired(level) / observed.xp * observed.seconds;
     averageKillSeconds += observed.seconds / (stage.to - stage.from);
+    averageXp += observed.xp / (stage.to - stage.from);
   }
   const hours = predictedSeconds / 3600;
-  const deviation = (hours / stage.hours - 1) * 100;
+  const targetHours = stage.hours / XP_MULTIPLIER;
+  const deviation = (hours / targetHours - 1) * 100;
   check(Math.abs(deviation) <= 20, `${characterClass} ${stage.from}→${stage.to} 성장 시간이 목표 ±20%를 벗어났습니다.`);
   totalHours[characterClass] += hours;
-  growthRows.push({ 직업: characterClass === 'knight' ? '기사' : '요정', 구간: `${stage.from}→${stage.to}`, 사냥터: ZONES[stage.zone].name, 목표시간: stage.hours, 예상시간: hours.toFixed(2), 차이: `${deviation.toFixed(1)}%`, 평균처치초: averageKillSeconds.toFixed(2) });
+  growthRows.push({ 직업: characterClass === 'knight' ? '기사' : '요정', 구간: `${stage.from}→${stage.to}`, 사냥터: ZONES[stage.zone].name, 목표시간: targetHours.toFixed(2), 예상시간: hours.toFixed(2), 차이: `${deviation.toFixed(1)}%`, 평균처치초: averageKillSeconds.toFixed(2), 평균경험치: averageXp.toFixed(1) });
 }
 console.log('실제 공통 전투 엔진 반복 시뮬레이션 — 200ms 틱, 1초 이동, 직업/레벨/몬스터별 8회');
 console.table(growthRows);
-console.log(`1→99레벨 예상 총시간: 기사 ${totalHours.knight.toFixed(2)}h / 요정 ${totalHours.elf.toFixed(2)}h (목표 13h)`);
+const targetTotalHours = GROWTH_STAGES.reduce((total, stage) => total + stage.hours / XP_MULTIPLIER, 0);
+console.log(`1→99레벨 예상 총시간: 기사 ${totalHours.knight.toFixed(2)}h / 요정 ${totalHours.elf.toFixed(2)}h (경험치 ${XP_MULTIPLIER}배, 목표 ${targetTotalHours.toFixed(2)}h)`);
 check(Math.max(totalHours.knight, totalHours.elf) / Math.min(totalHours.knight, totalHours.elf) <= 1.15, '직업 간 예상 성장 시간 차이가 15%를 초과합니다.');
 
 const volcanoRows: Record<string, string | number>[] = [];
