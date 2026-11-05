@@ -306,3 +306,88 @@ describe('물약과 경제', () => {
     expect(count(true) / count(false)).toBeLessThanOrEqual(2.1);
   });
 });
+
+describe('온라인 응답 지연 보정', () => {
+  function advance(s: GameState, duration: number, interval: number, dx = 0): GameState {
+    const end = s.time + duration;
+    while (s.time < end) s = applyAction(s, { type: 'tick', dx, dy: 0 }, Math.min(end, s.time + interval), rng);
+    return s;
+  }
+
+  it.each([800, 1500])('%ims 응답에서도 200ms 응답과 같은 서버 시간만큼 이동한다', interval => {
+    const initial = game();
+    const smooth = advance(initial, 6000, 200, 1);
+    const delayed = advance(initial, 6000, interval, 1);
+    expect(delayed.player.x).toBeCloseTo(SPAWN.x + 900);
+    expect(delayed.player.x).toBeCloseTo(smooth.player.x);
+    expect(delayed.time).toBe(smooth.time);
+    expect(initial.player.x).toBe(SPAWN.x);
+  });
+
+  it.each([800, 1500])('%ims 응답에서도 공격 주기와 중간 초록 물약 만료가 유지된다', interval => {
+    let initial = prepared();
+    initial.player.hp = 100000;
+    initial.monsters[0].hp = 100000;
+    initial.player.greenUntil = START + 10_000;
+    initial = applyAction(initial, { type: 'target', id: initial.monsters[0].id }, START);
+    const smooth = advance(initial, 24_000, 200);
+    const delayed = advance(initial, 24_000, interval);
+    expect(delayed.monsters[0].hp).toBe(smooth.monsters[0].hp);
+    expect(delayed.player.hp).toBe(smooth.player.hp);
+    expect(delayed.nextAttackAt).toBe(smooth.nextAttackAt);
+    expect(delayed.player.greenUntil).toBe(0);
+    expect(delayed.logs.filter(l => l.text === '초록 물약 효과가 종료되었습니다.')).toHaveLength(1);
+  });
+
+  it.each([800, 1500])('%ims 응답에서도 자동 물약을 서버 기준 초당 한 번만 사용한다', interval => {
+    const initial = prepared('island', 60);
+    initial.monsters = [];
+    initial.player.hp = 100;
+    initial.player.autoPotion.enabled = true;
+    const smooth = advance(initial, 12_000, 200);
+    const delayed = advance(initial, 12_000, interval);
+    expect(delayed.player.hp).toBe(smooth.player.hp);
+    expect(delayed.player.potions.red).toBe(smooth.player.potions.red);
+    expect(initial.player.potions.red - delayed.player.potions.red).toBe(12);
+    expect(delayed.nextPotionAt).toBe(smooth.nextPotionAt);
+  });
+
+  it('2초까지의 지연만 보정하고 그보다 긴 공백과 같은 시각의 재요청으로 사냥하지 않는다', () => {
+    let initial = prepared();
+    initial.monsters[0].hp = 1;
+    initial = applyAction(initial, { type: 'target', id: initial.monsters[0].id }, START);
+    const permitted = applyAction(initial, { type: 'tick', dx: 0, dy: 0 }, START + 2000, rng);
+    expect(permitted.player.kills).toBe(1);
+    const repeated = applyAction(permitted, { type: 'tick', dx: 0, dy: 0 }, permitted.time, rng);
+    expect(repeated.player).toEqual(permitted.player);
+    for (const elapsed of [2001, 60_000, 3_600_000]) {
+      const inactive = applyAction(initial, { type: 'tick', dx: 0, dy: 0 }, START + elapsed, rng);
+      expect(inactive.player).toEqual(initial.player);
+      expect(inactive.monsters).toEqual(initial.monsters);
+      expect(inactive.time).toBe(START + elapsed);
+    }
+  });
+
+  it('지연 중 사망하면 부활 위치에서 중단하고 남은 과거 입력을 버린다', () => {
+    const initial = prepared('volcano', 60, 7);
+    initial.player.hp = 1;
+    const after = applyAction(initial, { type: 'tick', dx: 1, dy: 0 }, START + 1500, rng);
+    expect(after.zone).toBe('island');
+    expect({ x: after.player.x, y: after.player.y }).toEqual(SPAWN);
+    expect(after.player.hp).toBe(stats(after.player).maxHp);
+    expect(after.time).toBe(START + 1500);
+  });
+
+  it('99레벨의 지연된 광역 공격도 실제 몬스터 수만 보상·집계한다', () => {
+    let initial = game();
+    initial.player.level = 99;
+    initial.monsters[0].x = initial.player.x + 30;
+    initial.monsters[0].y = initial.player.y;
+    initial = applyAction(initial, { type: 'target', id: initial.monsters[0].id }, START);
+    const after = applyAction(initial, { type: 'tick', dx: 0, dy: 0 }, START + 1500, rng);
+    expect(after.player.kills).toBe(initial.monsters.length);
+    expect(after.player.adena - initial.player.adena).toBe(50 * initial.monsters.length);
+    expect(after.player.xp).toBe(0);
+    expect(advance(after, 1500, 1500).player.kills).toBe(initial.monsters.length);
+  });
+});

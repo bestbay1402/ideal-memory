@@ -6,12 +6,14 @@ import { applyAction, appearance, createGame, power, stats, xpRequired } from '@
 import { CLASSES, ENHANCE_CHANCES, MONSTERS, POTIONS, ZONES } from '@/game/config';
 import type { Action, CharacterClass, GameState, HealPotionKind, PotionKind, ZoneId } from '@/game/types';
 import { getAuthClient, getAuthConfigurationError, onlineConfigured } from '@/lib/supabase';
-import { createOnlineGame, fetchRankings, loadGame, sendOnlineAction, type RankingEntry, type RankingKind } from '@/lib/transport';
+import { createOnlineGame, fetchRankings, loadOnlineGame, saveOnlineCheckpoint, type RankingEntry, type RankingKind } from '@/lib/transport';
+import { CheckpointSession } from '@/lib/checkpoint-session';
 
 const WorldChat = dynamic(() => import('./WorldChat'), { ssr: false });
 const GameCanvas = dynamic(() => import('./GameCanvas'), { ssr: false, loading: () => <div className="canvas-loading"><span className="rune-loader">✧</span> 모험의 세계를 불러오는 중…</div> });
 type Modal = 'play' | 'demo' | 'auth' | 'create' | 'inventory' | 'shop' | 'enhance' | 'ranking' | 'probability' | 'map' | 'help' | 'settings' | null;
 const DEMO_KEY = 'classic-beomjae-demo-v1';
+const AUTO_SAVE_MS = 10 * 60 * 1000;
 const CLASS_LABEL: Record<CharacterClass, string> = { knight: '기사', elf: '요정' };
 const number = (n: number) => Math.floor(n).toLocaleString('ko-KR');
 const potionKinds: PotionKind[] = ['red', 'orange', 'clear', 'green'];
@@ -52,9 +54,15 @@ export default function GameApp() {
   const [quantity, setQuantity] = useState(10);
   const [enhanceResult, setEnhanceResult] = useState<'success' | 'failure' | null>(null);
   const [compactLog, setCompactLog] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveFailed, setSaveFailed] = useState(false);
+  const [saveConflict, setSaveConflict] = useState(false);
+  const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
   const stateRef = useRef<GameState | null>(null);
   const modeRef = useRef<'demo' | 'online'>('demo');
   const tokenRef = useRef<string | null>(null);
+  const userRef = useRef<string | null>(null);
+  const onlineOwnerRef = useRef<string | null>(null);
   const runningRef = useRef(false);
   const movementRef = useRef({ dx: 0, dy: 0 });
   const pendingRef = useRef(false);
@@ -64,6 +72,10 @@ export default function GameApp() {
   const logsRef = useRef<HTMLDivElement>(null);
   const modalElementRef = useRef<HTMLElement>(null);
   const epochRef = useRef(0);
+  const checkpointRef = useRef<CheckpointSession | null>(null);
+  const clockRef = useRef({ server: 0, local: 0 });
+  const savesRef = useRef(0);
+  const leavingRef = useRef(false);
 
   const updateState = useCallback((next: GameState) => {
     stateRef.current = next;
@@ -72,8 +84,18 @@ export default function GameApp() {
       try { localStorage.setItem(DEMO_KEY, JSON.stringify(next)); setHasDemo(true); } catch { /* Storage-disabled browsers can still play this session. */ }
     }
   }, []);
-  const enterGame = useCallback((next: GameState, nextMode: 'demo' | 'online') => {
+  const enterGame = useCallback((next: GameState, nextMode: 'demo' | 'online', revision = 0, serverTime = Date.now()) => {
     epochRef.current++;
+    const epoch = epochRef.current;
+    onlineOwnerRef.current = nextMode === 'online' ? userRef.current : null;
+    checkpointRef.current = nextMode === 'online' ? new CheckpointSession(revision, (body, keepalive) => {
+      if (epoch !== epochRef.current || !tokenRef.current) return Promise.reject(Object.assign(new Error('로그인 상태가 바뀌었습니다. 다시 접속해주세요.'), { status: 401 }));
+      return saveOnlineCheckpoint(tokenRef.current, body, keepalive);
+    }) : null;
+    clockRef.current = { server: Math.max(serverTime, next.time), local: performance.now() };
+    savesRef.current = 0; leavingRef.current = false;
+    setSaving(false); setSaveFailed(false); setSaveConflict(false);
+    setLastSavedAt(nextMode === 'online' ? next.time : null);
     modeRef.current = nextMode;
     setMode(nextMode);
     updateState(next);
@@ -86,12 +108,18 @@ export default function GameApp() {
     setHasDemo(!!getSavedDemo());
     const auth = getAuthClient();
     if (!auth) { const issue = getAuthConfigurationError(); if (issue && onlineConfigured) setNotice(issue); return; }
-    auth.auth.getSession().then(({ data }) => { const access = data.session?.access_token ?? null; tokenRef.current = access; setToken(access); setSessionUserId(data.session?.user.id ?? null); }).catch(() => setNotice('로그인 정보를 확인하지 못했습니다. 다시 로그인해주세요.'));
+    auth.auth.getSession().then(({ data }) => { const access = data.session?.access_token ?? null; tokenRef.current = access; userRef.current = data.session?.user.id ?? null; setToken(access); setSessionUserId(userRef.current); }).catch(() => setNotice('로그인 정보를 확인하지 못했습니다. 다시 로그인해주세요.'));
     const { data } = auth.auth.onAuthStateChange((_event, session) => {
       tokenRef.current = session?.access_token ?? null;
+      userRef.current = session?.user.id ?? null;
       setToken(session?.access_token ?? null);
       setSessionUserId(session?.user.id ?? null);
-      if (!session && modeRef.current === 'online') { epochRef.current++; runningRef.current = false; movementRef.current = { dx: 0, dy: 0 }; setScreen('home'); setModal(null); }
+      if (modeRef.current === 'online' && checkpointRef.current && onlineOwnerRef.current !== userRef.current) {
+        epochRef.current++; checkpointRef.current = null;
+        runningRef.current = false; movementRef.current = { dx: 0, dy: 0 };
+        setScreen('home'); setModal(null); setSaving(false);
+        setNotice('로그인 계정이 바뀌었습니다. 게임 시작을 눌러 해당 계정의 기록을 불러와주세요.');
+      }
     });
     return () => data.subscription.unsubscribe();
   }, []);
@@ -119,6 +147,42 @@ export default function GameApp() {
   }, [modal]);
   useEffect(() => { if (notice) { const timer = setTimeout(() => setNotice(''), 6500); return () => clearTimeout(timer); } }, [notice]);
 
+  const saveGame = useCallback(async (keepalive = false, snapshot?: GameState): Promise<boolean> => {
+    const state = snapshot ?? stateRef.current;
+    const checkpoint = checkpointRef.current;
+    if (modeRef.current !== 'online' || !checkpoint || !state) return true;
+    const epoch = epochRef.current;
+    savesRef.current++; setSaving(true);
+    try {
+      // 응답을 기다리는 동안에도 전투는 계속됩니다. 응답으로 진행 중 상태를 덮어쓰지 않습니다.
+      const ack = await checkpoint.save(state, { keepalive });
+      if (epoch !== epochRef.current) return false;
+      setLastSavedAt(ack.savedAt); setSaveFailed(false);
+      setError(message => message.startsWith('저장하지 못했습니다.') ? '' : message);
+      return true;
+    } catch (e) {
+      if (epoch !== epochRef.current) return false;
+      setSaveFailed(true);
+      if (checkpoint.blocked) {
+        runningRef.current = false; movementRef.current = { dx: 0, dy: 0 };
+        setSaveConflict(true);
+        setError('다른 창이나 기기에서 저장된 기록이 있습니다. 기록 보호를 위해 이 창의 저장을 멈췄습니다. 서버 기록을 다시 불러와주세요.');
+      } else {
+        setError(`저장하지 못했습니다. 게임은 계속할 수 있습니다. 종료 전에 ‘지금 저장’을 다시 눌러주세요. ${e instanceof Error ? e.message : ''}`);
+      }
+      return false;
+    } finally {
+      if (epoch === epochRef.current) { savesRef.current--; setSaving(savesRef.current > 0); }
+    }
+  }, []);
+  useEffect(() => {
+    if (screen !== 'game' || mode !== 'online') return;
+    const interval = setInterval(() => { if (!leavingRef.current) void saveGame(); }, AUTO_SAVE_MS);
+    const exit = () => { if (!leavingRef.current) void saveGame(true); };
+    window.addEventListener('pagehide', exit);
+    return () => { clearInterval(interval); window.removeEventListener('pagehide', exit); };
+  }, [screen, mode, saveGame]);
+
   const perform = useCallback(async (action: Action, quiet = false) => {
     if (!stateRef.current || !runningRef.current) return;
     if (quiet && (requestRef.current || pendingRef.current)) return;
@@ -131,9 +195,12 @@ export default function GameApp() {
       if (!stateRef.current || !runningRef.current || epoch !== epochRef.current) return;
       try {
         const before = stateRef.current.player.enhancement;
-        const next = modeRef.current === 'demo'
-          ? applyAction(stateRef.current, action, Date.now())
-          : await sendOnlineAction(tokenRef.current!, action);
+        const beforeLevel = stateRef.current.player.level;
+        const now = modeRef.current === 'online'
+          ? Math.floor(clockRef.current.server + performance.now() - clockRef.current.local)
+          : Date.now();
+        // 두 모드 모두 같은 로컬 엔진으로 즉시 실행하며, 이동/공격마다 서버를 호출하지 않습니다.
+        const next = applyAction(stateRef.current, action, now);
         if (epoch !== epochRef.current) return;
         updateState(next);
         errorsRef.current = 0;
@@ -141,6 +208,9 @@ export default function GameApp() {
           setEnhanceResult(next.player.enhancement > before ? 'success' : 'failure');
           if (next.player.enhancement === 10) setNotice('전설의 탄생! +10 강화에 성공했습니다!');
         }
+        // 전체 축하 채팅이 필요한 드문 달성 기록만 10분을 기다리지 않고 저장합니다.
+        if (modeRef.current === 'online' && ((next.player.enhancement > before && next.player.enhancement >= 9)
+          || (beforeLevel < 90 && next.player.level >= 90) || (beforeLevel < 99 && next.player.level === 99))) void saveGame(false, next);
       } catch (e) {
         if (epoch !== epochRef.current) return;
         const message = e instanceof Error ? e.message : '요청을 처리하지 못했습니다. 잠시 후 다시 시도해주세요.';
@@ -152,7 +222,7 @@ export default function GameApp() {
     await request;
     if (requestRef.current === request) requestRef.current = null;
     if (!quiet) { pendingRef.current = false; setBusy(false); }
-  }, [updateState]);
+  }, [updateState, saveGame]);
   useEffect(() => {
     const interval = setInterval(() => {
       if (!runningRef.current || document.hidden) return;
@@ -162,7 +232,8 @@ export default function GameApp() {
     const blur = () => { movementRef.current = { dx: 0, dy: 0 }; };
     window.addEventListener('blur', blur);
     window.addEventListener('classic-chat-focus', blur);
-    return () => { clearInterval(interval); window.removeEventListener('blur', blur); window.removeEventListener('classic-chat-focus', blur); };
+    document.addEventListener('visibilitychange', blur);
+    return () => { clearInterval(interval); window.removeEventListener('blur', blur); window.removeEventListener('classic-chat-focus', blur); document.removeEventListener('visibilitychange', blur); };
   }, [perform]);
   useEffect(() => {
     const keys = (e: KeyboardEvent) => {
@@ -192,10 +263,12 @@ export default function GameApp() {
 
   async function startOnline() {
     if (!tokenRef.current) { setModal('auth'); return; }
+    const owner = userRef.current;
     setBusy(true); setError('');
     try {
-      const saved = await loadGame(tokenRef.current);
-      if (saved) enterGame(saved, 'online');
+      const saved = await loadOnlineGame(tokenRef.current);
+      if (owner !== userRef.current) return;
+      if (saved.state) enterGame(saved.state, 'online', saved.revision, saved.serverTime);
       else { setNickname(''); setModal('create'); }
     } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   }
@@ -210,10 +283,12 @@ export default function GameApp() {
       setPassword('');
       if (!result.data.session) { setNotice('가입 확인 메일을 보냈습니다. 메일의 링크를 누른 뒤 로그인해주세요.'); setSignup(false); return; }
       tokenRef.current = result.data.session.access_token;
+      userRef.current = result.data.session.user.id;
       setToken(result.data.session.access_token);
       setSessionUserId(result.data.session.user.id);
-      const saved = await loadGame(result.data.session.access_token);
-      if (saved) enterGame(saved, 'online'); else { setNickname(''); setModal('create'); }
+      const saved = await loadOnlineGame(result.data.session.access_token);
+      if (result.data.session.user.id !== userRef.current) return;
+      if (saved.state) enterGame(saved.state, 'online', saved.revision, saved.serverTime); else { setNickname(''); setModal('create'); }
     } catch (e) {
       const message = e instanceof Error ? e.message : '회원가입 또는 로그인 요청을 처리하지 못했습니다.';
       setError(/failed to fetch|networkerror|load failed/i.test(message) ? '인증 서버에 연결하지 못했습니다. 아래 연결 상태 확인을 눌러주세요.' : message);
@@ -225,7 +300,15 @@ export default function GameApp() {
       const name = nickname.trim();
       if (!/^[\p{L}\p{N}_]{2,14}$/u.test(name)) throw new Error('닉네임은 한글·영문·숫자·밑줄 2~14자로 입력해주세요.');
       if (modal === 'demo') enterGame(createGame(name, chosenClass, Date.now()), 'demo');
-      else enterGame(await createOnlineGame(tokenRef.current!, name, chosenClass), 'online');
+      else {
+        const owner = userRef.current;
+        await createOnlineGame(tokenRef.current!, name, chosenClass);
+        if (owner !== userRef.current) return;
+        const saved = await loadOnlineGame(tokenRef.current!);
+        if (owner !== userRef.current) return;
+        if (!saved.state) throw new Error('캐릭터를 불러오지 못했습니다. 다시 게임 시작을 눌러주세요.');
+        enterGame(saved.state, 'online', saved.revision, saved.serverTime);
+      }
     } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   }
   function continueDemo() {
@@ -233,9 +316,22 @@ export default function GameApp() {
     if (saved) enterGame(saved, 'demo'); else { setNickname('모험가'); setModal('demo'); }
   }
   async function goHome() {
+    if (leavingRef.current) return false;
+    leavingRef.current = true;
+    const epoch = epochRef.current;
     runningRef.current = false; movementRef.current = { dx: 0, dy: 0 };
     if (requestRef.current) await requestRef.current;
+    const saved = await saveGame();
+    if (epoch !== epochRef.current) return false;
+    if (!saved) {
+      leavingRef.current = false;
+      runningRef.current = !checkpointRef.current?.blocked;
+      return false;
+    }
+    epochRef.current++; checkpointRef.current = null;
     setScreen('home'); setModal(null);
+    leavingRef.current = false;
+    return true;
   }
   const player = game?.player;
   const derived = player ? stats(player) : null;
@@ -263,9 +359,10 @@ export default function GameApp() {
       <section className="home-features" aria-label="게임 메뉴"><button className="feature-card" aria-label="전체 랭킹 · 영웅의 전당" onClick={() => setModal('ranking')}><span className="feature-icon">♜</span><div><small>HALL OF HEROES</small><h2>영웅의 전당</h2><p>친구들과 함께 써 내려가는 전설</p></div><span className="feature-arrow">↗</span></button><button className="feature-card" onClick={() => setModal('probability')}><span className="feature-icon">✧</span><div><small>FORGE YOUR DESTINY</small><h2>무기 강화 확률표</h2><p>+10, 가장 빛나는 무기에 도전하세요</p></div><span className="feature-arrow">↗</span></button><button className="feature-card" onClick={() => setModal('help')}><span className="feature-icon">♧</span><div><small>BEGIN YOUR JOURNEY</small><h2>모험가 안내서</h2><p>첫 발걸음을 위한 작은 길잡이</p></div><span className="feature-arrow">↗</span></button></section>
       <footer className="home-footer"><span>CLASSIC <i>—</i> 범죄와의 전쟁</span><p>사냥하고, 성장하고, 전설이 되세요.</p><span>제작자 : 예수</span></footer>
     </> : game && player && derived && <>
-      <header className="game-header"><button className="game-logo" onClick={() => void goHome()} title="시작 화면으로">✥ <span>클래식<small>범죄와의 전쟁</small></span></button><div className="mode-badge"><b className={mode === 'online' ? 'status-dot online' : 'status-dot'} />{mode === 'demo' ? '로컬 데모' : '온라인 모험'}<small>{mode === 'demo' ? '이 브라우저에 저장 · 공용 랭킹 제외' : '서버 저장 · 공용 랭킹 참여'}</small></div><div className="header-actions"><button onClick={() => setModal('help')}>게임 방법</button><button onClick={() => setModal('settings')} aria-label="게임 설정">⚙</button></div></header>
+      <header className="game-header"><button className="game-logo" onClick={() => void goHome()} title="시작 화면으로">✥ <span>클래식<small>범죄와의 전쟁</small></span></button><div className="mode-badge"><b className={mode === 'online' ? 'status-dot online' : 'status-dot'} />{mode === 'demo' ? '로컬 데모' : '온라인 모험'}<small>{mode === 'demo' ? '이 브라우저에 저장 · 공용 랭킹 제외' : '10분마다 자동 저장 · 저장 시 랭킹 갱신'}</small>{mode === 'online' && <span className={`save-status ${saveFailed ? 'failed' : ''}`} data-testid="save-status">{saving ? '저장 중…' : saveFailed ? '저장 재시도 필요' : lastSavedAt ? `마지막 저장 ${new Date(lastSavedAt).toLocaleTimeString('ko-KR', { hour12: false })}` : '아직 저장하지 않음'}</span>}</div><div className="header-actions">{mode === 'online' && <button className="save-button" onClick={() => void saveGame()} disabled={saving || saveConflict}>지금 저장</button>}<button onClick={() => setModal('help')}>게임 방법</button><button onClick={() => setModal('settings')} aria-label="게임 설정">⚙</button></div></header>
+    {saveConflict && <div className="save-conflict" role="alert"><p>다른 창에서 저장한 기록과 충돌했습니다. 이 창의 저장되지 않은 진행을 버리고 서버 기록을 불러올 수 있습니다.</p><button className="button outline" onClick={() => void startOnline()} disabled={busy}>서버 기록 다시 불러오기</button></div>}
       <section className="player-hud"><div className="player-portrait"><WeaponIcon elf={player.class === 'elf'} golden={player.level >= 90 || player.enhancement === 10} size={51} /><span>{player.level}</span></div><div className="player-identity"><small>{CLASS_LABEL[player.class]} <span>· {appearance(player)}</span></small><h1 className={player.enhancement === 10 ? 'gold-name' : ''}>{player.nickname}</h1></div><div className="vitals"><div className="bar-label"><span>HP</span><b>{number(player.hp)} <i>/ {number(derived.maxHp)}</i></b></div><div className="meter hp-meter"><span style={{ width: `${Math.max(0, player.hp / derived.maxHp * 100)}%` }} /></div><div className="exp-line"><small>EXP</small><div className="meter exp-meter"><span style={{ width: `${xpPercent}%` }} /></div><small>{player.level >= 99 ? 'MAX' : `${xpPercent.toFixed(1)}%`}</small></div></div><div className="currency"><small>보유 아데나</small><strong><span>◈</span> {number(player.adena)}</strong></div><div className={`green-buff ${greenSeconds > 0 ? 'active' : ''}`}><PotionIcon kind="green" size={27} /><div><small>{greenSeconds > 0 ? '공격속도 ×2' : '초록 물약'}</small><strong>{greenSeconds > 0 ? `${Math.floor(greenSeconds / 60)}:${String(greenSeconds % 60).padStart(2, '0')}` : '효과 없음'}</strong></div></div></section>
-      <div className="game-layout"><section className="world-frame"><div className="world-caption"><div><span className="status-dot online" /><strong>{ZONES[game.zone].name}</strong><small>{game.zone === 'island' ? '비선공 지역' : '선공 몬스터 주의'}</small></div><button onClick={() => setModal('map')}>세계 지도 <kbd>M</kbd></button></div><GameCanvas state={game} onTarget={id => void perform({ type: 'target', id })} onMove={(dx, dy) => { movementRef.current = { dx, dy }; }} paused={!!modal} /><div className="world-hint"><span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> 이동</span><span>몬스터 클릭 · 자동 접근 및 공격</span><span>Lv. 99 · 절대자의 일격</span></div></section><aside className="adventure-sidebar"><section className="sidebar-panel"><p className="section-label">YOUR EQUIPMENT</p><h2>모험가의 장비</h2><div className="equipped-weapon"><WeaponIcon elf={player.class === 'elf'} golden={player.enhancement === 10} /><div><span className="equipment-level">+{player.enhancement}</span><strong>{CLASSES[player.class].weapon}</strong><small>방어구 +{player.enhancement} 연동</small></div></div><dl className="stats-list"><div><dt>공격력</dt><dd>{derived.attack}</dd></div><div><dt>방어력</dt><dd>{derived.defense}</dd></div><div><dt>종합 전투력</dt><dd className="gold-text">{number(power(player))}</dd></div><div><dt>누적 몬스터 처치</dt><dd>{number(player.kills ?? 0)}</dd></div></dl><button className="button outline full" onClick={() => setModal('enhance')}>✧ 무기 강화 <kbd>E</kbd></button></section><section className="sidebar-panel world-selector"><p className="section-label">THE FOUR REALMS</p><h2>사냥터 이동</h2><div className="mini-zones">{zoneOrder.map(zone => <button key={zone} className={`mini-zone zone-${zone} ${game.zone === zone ? 'selected' : ''}`} onClick={() => { if (player.enhancement >= ZONES[zone].requirement) void perform({ type: 'travel', zone }); else { setError(`+${ZONES[zone].requirement} 이상 무기가 필요합니다.`); setModal('map'); } }} disabled={busy || game.zone === zone} title={ZONES[zone].description}><span>{zone === 'island' ? '♧' : zone === 'temple' ? '♜' : zone === 'volcano' ? '♨' : '♖'}</span><b>{ZONES[zone].name}</b><small>{game.zone === zone ? '현재 위치' : player.enhancement < ZONES[zone].requirement ? `잠김 · +${ZONES[zone].requirement}` : ZONES[zone].requirement ? `+${ZONES[zone].requirement} 이상` : '입장 제한 없음'}</small></button>)}</div></section><div className="adventure-tip"><span>✦</span><p>강화 실패 시 무기는 사라지지 않고<br /><b>+3으로 돌아갑니다.</b></p></div></aside></div>
+      <div className="game-layout"><section className="world-frame"><div className="world-caption"><div><span className="status-dot online" /><strong>{ZONES[game.zone].name}</strong><small>{game.zone === 'island' ? '비선공 지역' : '선공 몬스터 주의'}</small></div><button onClick={() => setModal('map')}>세계 지도 <kbd>M</kbd></button></div><GameCanvas state={game} onTarget={id => void perform({ type: 'target', id })} onMove={(dx, dy) => { movementRef.current = { dx, dy }; }} paused={!!modal || saveConflict} /><div className="world-hint"><span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> 이동</span><span>몬스터 클릭 · 자동 접근 및 공격</span><span>Lv. 99 · 절대자의 일격</span></div></section><aside className="adventure-sidebar"><section className="sidebar-panel"><p className="section-label">YOUR EQUIPMENT</p><h2>모험가의 장비</h2><div className="equipped-weapon"><WeaponIcon elf={player.class === 'elf'} golden={player.enhancement === 10} /><div><span className="equipment-level">+{player.enhancement}</span><strong>{CLASSES[player.class].weapon}</strong><small>방어구 +{player.enhancement} 연동</small></div></div><dl className="stats-list"><div><dt>공격력</dt><dd>{derived.attack}</dd></div><div><dt>방어력</dt><dd>{derived.defense}</dd></div><div><dt>종합 전투력</dt><dd className="gold-text">{number(power(player))}</dd></div><div><dt>누적 몬스터 처치</dt><dd>{number(player.kills ?? 0)}</dd></div></dl><button className="button outline full" onClick={() => setModal('enhance')}>✧ 무기 강화 <kbd>E</kbd></button></section><section className="sidebar-panel world-selector"><p className="section-label">THE FOUR REALMS</p><h2>사냥터 이동</h2><div className="mini-zones">{zoneOrder.map(zone => <button key={zone} className={`mini-zone zone-${zone} ${game.zone === zone ? 'selected' : ''}`} onClick={() => { if (player.enhancement >= ZONES[zone].requirement) void perform({ type: 'travel', zone }); else { setError(`+${ZONES[zone].requirement} 이상 무기가 필요합니다.`); setModal('map'); } }} disabled={busy || game.zone === zone} title={ZONES[zone].description}><span>{zone === 'island' ? '♧' : zone === 'temple' ? '♜' : zone === 'volcano' ? '♨' : '♖'}</span><b>{ZONES[zone].name}</b><small>{game.zone === zone ? '현재 위치' : player.enhancement < ZONES[zone].requirement ? `잠김 · +${ZONES[zone].requirement}` : ZONES[zone].requirement ? `+${ZONES[zone].requirement} 이상` : '입장 제한 없음'}</small></button>)}</div></section><div className="adventure-tip"><span>✦</span><p>강화 실패 시 무기는 사라지지 않고<br /><b>+3으로 돌아갑니다.</b></p></div></aside></div>
       <section className="action-bar"><div className="quick-potions">{potionKinds.map((kind, index) => <button key={kind} title={`${POTIONS[kind].name} 사용`} aria-label={`${POTIONS[kind].name} 사용`} onClick={() => void perform({ type: 'usePotion', kind })} disabled={busy || player.potions[kind] <= 0}><kbd>{index + 1}</kbd><PotionIcon kind={kind} /><span>{player.potions[kind]}</span></button>)}</div><div className="toolbar">{([['inventory', '▦', '인벤토리', 'I'], ['shop', '◈', '상점', 'B'], ['enhance', '✧', '무기 강화', 'E'], ['ranking', '♜', '랭킹', 'R'], ['help', '?', '도움말', 'H']] as const).map(([name, icon, label, key]) => <button key={name} onClick={() => setModal(name)}><span>{icon}</span>{label}<kbd>{key}</kbd></button>)}</div><button className={`auto-indicator ${player.autoPotion.enabled ? 'enabled' : ''}`} onClick={() => setModal('inventory')}><i />자동 물약 <b>{player.autoPotion.enabled ? 'ON' : 'OFF'}</b></button></section>
       <WorldChat enabled={mode === 'online'} token={token} userId={sessionUserId} />
       <section className={`log-panel ${compactLog ? 'compact' : ''}`}><div className="log-heading"><span>모험 기록 <small>SYSTEM LOG</small></span><button onClick={() => setCompactLog(!compactLog)} aria-label={compactLog ? '로그 펼치기' : '로그 접기'}>{compactLog ? '+' : '−'}</button></div><div className="log-content" ref={logsRef}>{game.logs.slice(-35).map(log => <p key={log.id} className={`log-${log.kind}`}><time>{new Date(log.time).toLocaleTimeString('ko-KR', { hour12: false })}</time>{log.text}</p>)}</div></section>
@@ -283,10 +380,10 @@ export default function GameApp() {
       {modal === 'shop' && player && <><p className="shop-wallet">보유 아데나 <strong>◈ {number(player.adena)}</strong></p><div className="shop-products">{potionKinds.map(kind => <button key={kind} className={shopKind === kind ? 'selected' : ''} onClick={() => setShopKind(kind)}><PotionIcon kind={kind} size={46} /><strong>{POTIONS[kind].name}</strong><small>{kind === 'green' ? '공격속도 ×2 · 10분' : `HP ${POTIONS[kind].heal} 회복`}</small><b>◈ {number(POTIONS[kind].price)}</b></button>)}</div><div className="purchase-line"><label>구매 수량<input type="number" min={1} max={999} value={quantity} onChange={e => setQuantity(Math.max(1, Math.min(999, Math.trunc(Number(e.target.value) || 1))))} /></label><div><small>총 구매 금액</small><strong className={quantity * POTIONS[shopKind].price > player.adena ? 'danger-text' : 'gold-text'}>◈ {number(quantity * POTIONS[shopKind].price)}</strong></div></div><button className="button primary full" disabled={busy || quantity * POTIONS[shopKind].price > player.adena} onClick={() => void perform({ type: 'buy', kind: shopKind, quantity }).then(() => undefined)}>{busy ? '구매 중…' : quantity * POTIONS[shopKind].price > player.adena ? '아데나가 부족합니다' : `${POTIONS[shopKind].name} ${quantity}개 구매`}</button><p className="local-note">구매와 소모 결과는 즉시 저장됩니다.</p></>}
       {modal === 'enhance' && player && <div className={`enhancement ${enhanceResult || ''}`}><div className="forge-ring"><span className="forge-symbol">✧</span><WeaponIcon elf={player.class === 'elf'} golden={player.enhancement === 10} size={100} /></div><p className="section-label">{player.enhancement === 10 ? 'LEGENDARY WEAPON' : 'FORGE YOUR DESTINY'}</p><h3>+{player.enhancement} {CLASSES[player.class].weapon}</h3><p className="muted">무기와 방어구의 강화 수치가 함께 증가합니다.</p>{enhanceResult && <div className={`enhance-message ${enhanceResult}`}>{enhanceResult === 'success' ? `✦ 강화 성공! +${player.enhancement}의 힘이 깃들었습니다.` : '강화 실패… 무기와 방어구가 +3이 되었습니다.'}</div>}{player.enhancement < 10 ? <><div className="enhance-preview"><div><small>도전 단계</small><strong>+{player.enhancement} <span>→</span> +{player.enhancement + 1}</strong></div><div><small>성공 확률</small><strong className="gold-text">{Math.round(ENHANCE_CHANCES[player.enhancement] * 100)}<i>%</i></strong></div></div><div className="scroll-count"><ScrollIcon /><span>무기강화주문서</span><strong>{player.scrolls}장 <small> / 1장 필요</small></strong></div><p className="enhance-warning">실패 시 무기와 방어구는 +3으로 초기화됩니다.<br />상위 사냥터의 입장 조건이 부족해지면 말하는 섬으로 이동합니다.</p><button className="button primary full" disabled={busy || player.scrolls < 1} onClick={() => void perform({ type: 'enhance' })}>{busy ? '무기에 힘을 불어넣는 중…' : player.scrolls < 1 ? '강화주문서가 부족합니다' : '✧ 무기 강화하기'}</button></> : <div className="legendary-label">✦ 최고의 경지에 도달한 무기 ✦<p>일반 공격 시 10% 확률로 {player.class === 'knight' ? '광역 검기' : '관통 화살'} 발동</p></div>}<button className="text-button" onClick={() => setModal('probability')}>전체 강화 확률표 보기 ↗</button></div>}
       {modal === 'probability' && <><p className="muted">모든 직업에 동일하게 적용됩니다. 매 시도는 독립적으로 판정합니다.</p><table className="probability-table"><thead><tr><th>강화 단계</th><th>성공 확률</th><th>실패 시</th></tr></thead><tbody>{ENHANCE_CHANCES.map((chance, index) => <tr key={index} className={index === 9 ? 'legendary-row' : ''}><td>+{index} <span>→</span> <b>+{index + 1}</b></td><td><div className="probability-bar"><i style={{ width: `${chance * 100}%` }} /><b>{Math.round(chance * 100)}%</b></div></td><td>{chance === 1 ? '실패 없음' : '+3으로 초기화'}</td></tr>)}</tbody></table><p className="local-note">성공·실패 모두 주문서 1장 소모 · 무기 소멸 없음 · 최대 +10<br />온라인 강화 확률과 결과는 서버에서 결정합니다.</p></>}
-      {modal === 'ranking' && <><p className="muted">각자의 모험, 하나의 전당. 실제 온라인 캐릭터만 표시됩니다.</p><div className="tab-row">{([['power', '종합 전투력'], ['level', '레벨'], ['weapon', '무기 강화']] as const).map(([key, label]) => <button key={key} className={rankingKind === key ? 'active' : ''} onClick={() => setRankingKind(key)}>{label}</button>)}</div>{rankingLoading ? <div className="empty-state">영웅의 기록을 불러오는 중…</div> : rankingError ? <div className="empty-state"><span>♜</span><h3>아직 전당의 문이 열리지 않았습니다</h3><p>{rankingError}</p><small>로컬 데모 캐릭터는 이 목록에 등록되지 않습니다.</small></div> : rankings.length === 0 ? <div className="empty-state"><span>♜</span><h3>첫 번째 전설을 기다립니다</h3><p>아직 등록된 온라인 캐릭터가 없습니다.<br />계정을 만들고 첫 모험을 시작해보세요.</p></div> : <div className="ranking-scroll"><table className="ranking-table"><thead><tr><th>순위</th><th>모험가</th><th>레벨</th><th>무기 / 방어구</th><th>전투력</th><th>최고 강화</th><th>몬스터 처치 수</th></tr></thead><tbody>{rankings.map((entry, index) => <tr key={`${entry.nickname}-${index}`}><td><span className={`rank-number rank-${index + 1}`}>{index + 1}</span></td><td><strong className={entry.enhancement === 10 ? 'gold-name' : ''}>{entry.nickname}</strong><small>{CLASS_LABEL[entry.class]}</small></td><td>{entry.level}<small>EXP {number(entry.xp)}</small></td><td>+{entry.enhancement} {CLASSES[entry.class].weapon}<small>방어구 +{entry.enhancement}</small></td><td className="gold-text">{number(entry.power)}</td><td>+{entry.bestEnhancement}</td><td className="kill-count">{number(entry.kills ?? 0)}</td></tr>)}</tbody></table></div>}<p className="local-note">종합 전투력 = 레벨 × 100 + 현재 무기 강화 × 1,000<br />몬스터 처치 수는 모든 사냥터의 누적 기록이며, 사망·재접속 후에도 유지됩니다.</p></>}
+      {modal === 'ranking' && <><p className="muted">각자의 모험, 하나의 전당. 실제 온라인 캐릭터만 표시됩니다.</p><div className="tab-row">{([['power', '종합 전투력'], ['level', '레벨'], ['weapon', '무기 강화']] as const).map(([key, label]) => <button key={key} className={rankingKind === key ? 'active' : ''} onClick={() => setRankingKind(key)}>{label}</button>)}</div>{rankingLoading ? <div className="empty-state">영웅의 기록을 불러오는 중…</div> : rankingError ? <div className="empty-state"><span>♜</span><h3>아직 전당의 문이 열리지 않았습니다</h3><p>{rankingError}</p><small>로컬 데모 캐릭터는 이 목록에 등록되지 않습니다.</small></div> : rankings.length === 0 ? <div className="empty-state"><span>♜</span><h3>첫 번째 전설을 기다립니다</h3><p>아직 등록된 온라인 캐릭터가 없습니다.<br />계정을 만들고 첫 모험을 시작해보세요.</p></div> : <div className="ranking-scroll"><table className="ranking-table"><thead><tr><th>순위</th><th>모험가</th><th>레벨</th><th>무기 / 방어구</th><th>전투력</th><th>최고 강화</th><th>몬스터 처치 수</th></tr></thead><tbody>{rankings.map((entry, index) => <tr key={`${entry.nickname}-${index}`}><td><span className={`rank-number rank-${index + 1}`}>{index + 1}</span></td><td><strong className={entry.enhancement === 10 ? 'gold-name' : ''}>{entry.nickname}</strong><small>{CLASS_LABEL[entry.class]}</small></td><td>{entry.level}<small>EXP {number(entry.xp)}</small></td><td>+{entry.enhancement} {CLASSES[entry.class].weapon}<small>방어구 +{entry.enhancement}</small></td><td className="gold-text">{number(entry.power)}</td><td>+{entry.bestEnhancement}</td><td className="kill-count">{number(entry.kills ?? 0)}</td></tr>)}</tbody></table></div>}<p className="local-note">종합 전투력 = 레벨 × 100 + 현재 무기 강화 × 1,000<br />랭킹은 10분 자동 저장 또는 지금 저장 후 갱신됩니다.<br />몬스터 처치 수는 모든 사냥터의 누적 기록이며, 저장된 처치 수는 사망·재접속 후에도 유지됩니다.</p></>}
       {modal === 'map' && <><p className="muted">시계방향으로 이어지는 네 개의 세계. 더 강한 무기가 새로운 길을 엽니다.</p><div className="map-zones">{zoneOrder.map(zone => <button key={zone} className={`map-zone zone-${zone} ${game?.zone === zone ? 'selected' : ''}`} disabled={!player || busy || game?.zone === zone || player.enhancement < ZONES[zone].requirement} onClick={() => void perform({ type: 'travel', zone }).then(() => setModal(null))}><span className="map-emblem">{zone === 'island' ? '♧' : zone === 'temple' ? '♜' : zone === 'volcano' ? '♨' : '♖'}</span><small>REGION {zone === 'island' ? '01' : zone === 'temple' ? '02' : zone === 'volcano' ? '03' : '04'}</small><h3>{ZONES[zone].name}</h3><p>{ZONES[zone].description}</p><span>{ZONES[zone].monsters.map(m => MONSTERS[m].name).join(' · ')}</span><b>{game?.zone === zone ? '현재 위치' : ZONES[zone].requirement === 0 ? '누구나 입장' : `+${ZONES[zone].requirement} 이상 무기 필요`}</b><em>EXP {ZONES[zone].xp.join('~')} · 주문서 {Math.round(ZONES[zone].scrollChance * 100)}%</em></button>)}</div></>}
-      {modal === 'help' && <div className="help-content"><div className="help-intro"><span>⚔</span><div><h3>당신만의 속도로, 전설을 향해.</h3><p>실시간 공동 사냥 없이 혼자 성장하고, 친구들과 기록으로 경쟁하는 클래식 RPG입니다.</p></div></div><div className="help-grid"><article><b>01</b><h3>이동과 사냥</h3><p><kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> 또는 방향키로 이동합니다. 몬스터를 클릭하면 자동으로 접근해 공격합니다. 직접 이동하면 공격을 멈추고 이동합니다.</p></article><article><b>02</b><h3>강화와 성장</h3><p>몬스터에게서 아데나, 경험치, 강화주문서를 얻습니다. <kbd>E</kbd>에서 무기를 강화하세요. +6 신전, +7 화룡, +9 오만의 탑이 열립니다.</p></article><article><b>03</b><h3>물약과 생존</h3><p><kbd>B</kbd> 상점에서 물약을 구매합니다. <kbd>I</kbd> 인벤토리에서 자동 물약을 켜세요. 초록 물약은 10분간 공격속도가 2배입니다.</p></article><article><b>04</b><h3>전설의 경지</h3><p>30·60·90레벨에 자동 변신합니다. 99레벨에는 한 번의 공격으로 지역의 모든 몬스터를 처치합니다. 사망해도 경험치나 장비를 잃지 않습니다.</p></article></div><div className="shortcut-list"><span><kbd>I</kbd> 인벤토리</span><span><kbd>E</kbd> 강화</span><span><kbd>R</kbd> 랭킹</span><span><kbd>B</kbd> 상점</span><span><kbd>M</kbd> 지도</span><span><kbd>H</kbd> 도움말</span><span><kbd>1–4</kbd> 물약</span><span><kbd>Enter</kbd> 전체 채팅</span><span><kbd>ESC</kbd> 창 닫기</span></div><p className="local-note">로컬 데모는 브라우저에만 저장되고, 온라인 캐릭터와 공용 랭킹에 영향을 주지 않습니다.<br />온라인 플레이는 같은 계정으로 다른 컴퓨터에서도 이어갈 수 있습니다.</p></div>}
-      {modal === 'settings' && <div className="settings-content"><div className="setting-row"><div><h3>플레이 모드</h3><p>{mode === 'demo' ? '로컬 데모 · 현재 브라우저에 자동 저장됩니다.' : '온라인 · 서버에 자동 저장됩니다.'}</p></div><span className="mode-tag">{mode === 'demo' ? 'DEMO' : 'ONLINE'}</span></div><div className="setting-row"><div><h3>시스템 로그</h3><p>화면 하단의 기록 표시를 줄입니다.</p></div><button className={`toggle ${compactLog ? 'on' : ''}`} onClick={() => setCompactLog(!compactLog)}>{compactLog ? '접기' : '펼치기'}</button></div><button className="button outline full" onClick={() => void goHome()}>저장하고 시작 화면으로</button>{mode === 'demo' && <button className="text-button danger-text" onClick={async () => { await goHome(); setNickname('모험가'); setModal('demo'); }}>새 데모 캐릭터 만들기</button>}{token && <button className="text-button" onClick={async () => { await goHome(); await getAuthClient()?.auth.signOut(); setNotice('로그아웃했습니다. 캐릭터는 서버에 보관됩니다.'); }}>계정 로그아웃</button>}</div>}
+      {modal === 'help' && <div className="help-content"><div className="help-intro"><span>⚔</span><div><h3>당신만의 속도로, 전설을 향해.</h3><p>실시간 공동 사냥 없이 혼자 성장하고, 친구들과 기록으로 경쟁하는 클래식 RPG입니다.</p></div></div><div className="help-grid"><article><b>01</b><h3>이동과 사냥</h3><p><kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> 또는 방향키로 이동합니다. 몬스터를 클릭하면 자동으로 접근해 공격합니다. 직접 이동하면 공격을 멈추고 이동합니다.</p></article><article><b>02</b><h3>강화와 성장</h3><p>몬스터에게서 아데나, 경험치, 강화주문서를 얻습니다. <kbd>E</kbd>에서 무기를 강화하세요. +6 신전, +7 화룡, +9 오만의 탑이 열립니다.</p></article><article><b>03</b><h3>물약과 생존</h3><p><kbd>B</kbd> 상점에서 물약을 구매합니다. <kbd>I</kbd> 인벤토리에서 자동 물약을 켜세요. 초록 물약은 10분간 공격속도가 2배입니다.</p></article><article><b>04</b><h3>전설의 경지</h3><p>30·60·90레벨에 자동 변신합니다. 99레벨에는 한 번의 공격으로 지역의 모든 몬스터를 처치합니다. 사망해도 경험치나 장비를 잃지 않습니다.</p></article></div><div className="shortcut-list"><span><kbd>I</kbd> 인벤토리</span><span><kbd>E</kbd> 강화</span><span><kbd>R</kbd> 랭킹</span><span><kbd>B</kbd> 상점</span><span><kbd>M</kbd> 지도</span><span><kbd>H</kbd> 도움말</span><span><kbd>1–4</kbd> 물약</span><span><kbd>Enter</kbd> 전체 채팅</span><span><kbd>ESC</kbd> 창 닫기</span></div><p className="local-note">로컬 데모는 브라우저에만 저장되고, 온라인 캐릭터와 공용 랭킹에 영향을 주지 않습니다.<br />온라인 기록은 10분마다 저장됩니다. 종료 전 상단의 지금 저장을 눌러주세요. 강제 종료 시 마지막 저장 이후 기록이 사라질 수 있습니다.<br />같은 계정으로 다른 컴퓨터에서 마지막 저장 기록을 이어갈 수 있습니다.</p></div>}
+      {modal === 'settings' && <div className="settings-content"><div className="setting-row"><div><h3>플레이 모드</h3><p>{mode === 'demo' ? '로컬 데모 · 현재 브라우저에 자동 저장됩니다.' : '온라인 · 10분마다 자동 저장됩니다. 지금 저장 또는 정상 종료 시에도 저장합니다.'}</p></div><span className="mode-tag">{mode === 'demo' ? 'DEMO' : 'ONLINE'}</span></div><div className="setting-row"><div><h3>시스템 로그</h3><p>화면 하단의 기록 표시를 줄입니다.</p></div><button className={`toggle ${compactLog ? 'on' : ''}`} onClick={() => setCompactLog(!compactLog)}>{compactLog ? '접기' : '펼치기'}</button></div><button className="button outline full" onClick={() => void goHome()}>저장하고 시작 화면으로</button>{mode === 'demo' && <button className="text-button danger-text" onClick={async () => { await goHome(); setNickname('모험가'); setModal('demo'); }}>새 데모 캐릭터 만들기</button>}{token && <button className="text-button" onClick={async () => { if (!await goHome()) return; await getAuthClient()?.auth.signOut(); setNotice('로그아웃했습니다. 캐릭터는 서버에 보관됩니다.'); }}>계정 로그아웃</button>}</div>}
     </div><footer className="modal-footer"><span>제작자 : 예수</span><small><kbd>ESC</kbd> 닫기</small></footer></section></div>}
   </main>;
 }

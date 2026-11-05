@@ -159,7 +159,7 @@ function randomInt(min: number, max: number, rng: () => number) { return min + M
 function kill(s: GameState, m: Monster, rng: () => number) {
   if (!m.alive) return; // 같은 생명 주기의 보상을 정확히 한 번만 지급합니다.
   m.alive = false; m.hp = 0; m.aggro = false; m.respawnAt = s.time + RESPAWN_MS;
-  s.player.kills++; // 보상과 동일한 서버 트랜잭션으로 저장하며 광역 처치도 1마리당 1회입니다.
+  s.player.kills++; // 광역 처치도 살아 있는 몬스터 1마리당 1회만 집계하며 누적값을 함께 저장합니다.
   if (s.targetId === m.id) s.targetId = null;
   effect(s, 'death', m, { text: MONSTERS[m.kind].name });
   const zone = ZONES[s.zone];
@@ -210,7 +210,7 @@ function die(s: GameState) {
   s.player.hp = stats(s.player).maxHp;
   effect(s, 'respawn', s.player);
 }
-function tick(s: GameState, action: Extract<Action, { type: 'tick' }>, dt: number, rng: () => number) {
+function tick(s: GameState, action: Extract<Action, { type: 'tick' }>, dt: number, rng: () => number): boolean {
   const p = s.player;
   for (const m of s.monsters) if (!m.alive && m.respawnAt <= s.time) {
     m.alive = true; m.hp = m.maxHp; m.x = m.homeX; m.y = m.homeY;
@@ -240,7 +240,7 @@ function tick(s: GameState, action: Extract<Action, { type: 'tick' }>, dt: numbe
         p.hp = Math.max(0, p.hp - hit);
         effect(s, 'slash', m, { toX: p.x, toY: p.y });
         effect(s, 'hit', p, { value: hit });
-        if (p.hp === 0) { die(s); break; }
+        if (p.hp === 0) { die(s); return false; }
       }
     } else {
       const index = Number(m.id.split('-').at(-1)) || 0;
@@ -249,7 +249,24 @@ function tick(s: GameState, action: Extract<Action, { type: 'tick' }>, dt: numbe
     }
   }
   if (p.autoPotion.enabled && p.hp <= stats(p).maxHp * AUTO_POTION_THRESHOLD) usePotion(s, p.autoPotion.kind, true);
+  return true;
 }
+
+function advanceClock(s: GameState, now: number) {
+  s.time = now;
+  if (s.player.greenUntil > 0 && s.player.greenUntil <= now) {
+    s.player.greenUntil = 0;
+    log(s, '초록 물약 효과가 종료되었습니다.', 'warning');
+  } else if (s.player.greenUntil > now && s.player.greenUntil - now <= 30_000 && !s.greenWarningSent) {
+    s.greenWarningSent = true;
+    log(s, '초록 물약 효과가 30초 후 종료됩니다.', 'warning');
+  }
+}
+
+// 프레임/타이머가 잠깐 늦어져도 이동·공격을 짧은 단위로 나누어 처리합니다.
+// 온라인 화면은 로그인 때 받은 서버 시각에 단조 증가 시간을 더하며, 2초 초과 공백은 재생하지 않습니다.
+const SIMULATION_STEP_MS = 100;
+const MAX_CATCH_UP_MS = 2000;
 
 export function applyAction(previous: GameState, input: Action, now: number, rng: () => number = Math.random): GameState {
   const action = validateAction(input);
@@ -259,20 +276,18 @@ export function applyAction(previous: GameState, input: Action, now: number, rng
   s.player.kills ??= 0;
   s.zoneMonsters ??= {};
   const elapsed = now - s.time;
-  s.time = now;
-  s.effects = s.effects.filter(e => now - e.time < 2200).slice(-100);
-  if (s.player.greenUntil > 0 && s.player.greenUntil <= now) {
-    s.player.greenUntil = 0;
-    log(s, '초록 물약 효과가 종료되었습니다.', 'warning');
-  } else if (s.player.greenUntil > now && s.player.greenUntil - now <= 30_000 && !s.greenWarningSent) {
-    s.greenWarningSent = true;
-    log(s, '초록 물약 효과가 30초 후 종료됩니다.', 'warning');
+  if (action.type === 'tick' && elapsed > 0 && elapsed <= MAX_CATCH_UP_MS) {
+    while (s.time < now) {
+      const dt = Math.min(SIMULATION_STEP_MS, now - s.time);
+      advanceClock(s, s.time + dt);
+      // 사망 후에는 남은 이전 이동 입력을 폐기하고 부활 위치를 유지합니다.
+      if (!tick(s, action, dt, rng)) break;
+    }
   }
+  advanceClock(s, now);
   const p = s.player;
   switch (action.type) {
     case 'tick':
-      // 재접속·백그라운드 탭의 경과 시간으로 자동 사냥 보상을 만들지 않습니다.
-      if (elapsed <= 2000 && elapsed > 0) tick(s, action, Math.min(MAX_TICK_MS, elapsed), rng);
       break;
     case 'target':
       if (!s.monsters.some(m => m.id === action.id && m.alive)) throw new Error('이미 사라진 몬스터입니다.');
@@ -317,5 +332,6 @@ export function applyAction(previous: GameState, input: Action, now: number, rng
       log(s, `자동 물약 ${action.enabled ? 'ON' : 'OFF'} · ${POTIONS[action.kind].name}`);
       break;
   }
+  s.effects = s.effects.filter(e => now - e.time < 2200).slice(-100);
   return s;
 }

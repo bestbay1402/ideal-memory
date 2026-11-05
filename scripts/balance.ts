@@ -77,7 +77,7 @@ for (const characterClass of ['knight', 'elf'] as const) for (const stage of GRO
   totalHours[characterClass] += hours;
   growthRows.push({ 직업: characterClass === 'knight' ? '기사' : '요정', 구간: `${stage.from}→${stage.to}`, 사냥터: ZONES[stage.zone].name, 목표시간: stage.hours, 예상시간: hours.toFixed(2), 차이: `${deviation.toFixed(1)}%`, 평균처치초: averageKillSeconds.toFixed(2) });
 }
-console.log('실제 서버 전투 엔진 반복 시뮬레이션 — 200ms 틱, 1초 이동, 직업/레벨/몬스터별 8회');
+console.log('실제 공통 전투 엔진 반복 시뮬레이션 — 200ms 틱, 1초 이동, 직업/레벨/몬스터별 8회');
 console.table(growthRows);
 console.log(`1→99레벨 예상 총시간: 기사 ${totalHours.knight.toFixed(2)}h / 요정 ${totalHours.elf.toFixed(2)}h (목표 13h)`);
 check(Math.max(totalHours.knight, totalHours.elf) / Math.min(totalHours.knight, totalHours.elf) <= 1.15, '직업 간 예상 성장 시간 차이가 15%를 초과합니다.');

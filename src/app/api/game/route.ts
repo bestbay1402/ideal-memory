@@ -8,7 +8,7 @@ export async function GET(request: Request) {
   try {
     const owner = await authenticate(request);
     const game = await databaseStore().read(owner);
-    return Response.json({ state: game?.state ?? null }, { headers: { 'Cache-Control': 'no-store' } });
+    return Response.json({ state: game?.state ?? null, revision: game?.revision ?? 0, serverTime: Date.now() }, { headers: { 'Cache-Control': 'no-store' } });
   } catch (error) { return errorResponse(error); }
 }
 export async function POST(request: Request) {
